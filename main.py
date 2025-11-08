@@ -1,50 +1,29 @@
-"""
-Hyperliquid Whale Tracker - Backend API
-Sistema profissional para rastreamento de whales em tempo real
-"""
-
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from typing import List, Dict, Optional
 import httpx
-from datetime import datetime, timedelta
-from collections import defaultdict
+from datetime import datetime, timezone
 import asyncio
+from typing import Dict, List, Optional
 from pydantic import BaseModel
 
-app = FastAPI(
-    title="Hyperliquid Whale Tracker API",
-    description="API para rastreamento de whales em tempo real",
-    version="1.0.0"
-)
+app = FastAPI(title="Hyperliquid Whale Tracker API")
 
-# Configuração CORS (permite frontend conectar)
+# CORS configurado
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Em produção, especifique seu domínio
+    allow_origins=["*"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ============================================================================
-# CONFIGURAÇÕES E CACHE
-# ============================================================================
+# ============================================
+# CONFIGURAÇÕES
+# ============================================
 
-HYPERLIQUID_API_URL = "https://api.hyperliquid.xyz/info"
+HYPERLIQUID_API = "https://api.hyperliquid.xyz"
 
-# Cache simples em memória (melhor que fazer request toda hora)
-cache = {
-    "whales": [],
-    "last_update": None,
-    "positions": {},
-    "trades": {},
-    "liquidations": defaultdict(list)
-}
-
-CACHE_DURATION = 30  # segundos - atualiza a cada 30s
-
-# Lista de endereços conhecidos de whales (você pode expandir)
+# 🎯 11 ENDEREÇOS CORRETOS DAS WHALES
 KNOWN_WHALES = [
     "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9",
     "0x939f95036D2e7b6d7419Ec072BF9d967352204d2",
@@ -59,394 +38,329 @@ KNOWN_WHALES = [
     "0x5b5d51203a0f9079f8aeb098a6523a13F298C060",
 ]
 
-# ============================================================================
-# MODELOS DE DADOS
-# ============================================================================
+# Cache simples em memória
+cache = {
+    "whales": [],
+    "last_update": None,
+    "update_interval": 30  # segundos
+}
 
-class WhaleWallet(BaseModel):
+# ============================================
+# MODELOS DE DADOS
+# ============================================
+
+class WhaleData(BaseModel):
     address: str
     nickname: str
     total_value: float
-    pnl_24h: float
-    pnl_percentage: float
-    status: str  # "online", "warning", "offline"
     positions_count: int
-    last_activity: str
+    pnl_24h: float
+    last_trade: Optional[str]
+    risk_level: str
+    wallet_link: str
 
 class Position(BaseModel):
-    symbol: str
-    side: str  # "LONG" ou "SHORT"
+    token: str
+    side: str
     size: float
     entry_price: float
     current_price: float
     pnl: float
-    pnl_percentage: float
     leverage: float
     liquidation_price: Optional[float]
 
 class Trade(BaseModel):
     timestamp: str
-    symbol: str
-    side: str
-    price: float
-    size: float
-    total_value: float
-
-class Liquidation(BaseModel):
-    timestamp: str
-    address: str
-    symbol: str
+    token: str
     side: str
     size: float
     price: float
-    value: float
+    pnl: float
 
-# ============================================================================
-# FUNÇÕES AUXILIARES - CONEXÃO COM HYPERLIQUID
-# ============================================================================
+# ============================================
+# FUNÇÕES AUXILIARES
+# ============================================
 
-async def fetch_hyperliquid_data(endpoint: str, data: dict) -> dict:
-    """Faz request para API da Hyperliquid"""
-    async with httpx.AsyncClient(timeout=30.0) as client:
-        try:
-            response = await client.post(
-                HYPERLIQUID_API_URL,
-                json={"type": endpoint, **data}
-            )
-            response.raise_for_status()
-            return response.json()
-        except Exception as e:
-            print(f"❌ Erro ao buscar dados: {e}")
-            return None
+def get_whale_nickname(address: str) -> str:
+    """Gera nickname baseado no endereço"""
+    nicknames = {
+        0: "Alpha", 1: "Sigma", 2: "Gamma", 3: "Delta", 4: "Epsilon",
+        5: "Zeta", 6: "Theta", 7: "Kappa", 8: "Lambda", 9: "Omega", 10: "Phantom"
+    }
+    index = KNOWN_WHALES.index(address) if address in KNOWN_WHALES else 0
+    return f"{nicknames.get(index, 'Whale')} #{address[-4:]}"
 
-async def get_user_state(address: str) -> dict:
-    """Busca estado completo de um usuário"""
-    return await fetch_hyperliquid_data("clearinghouseState", {"user": address})
+def get_wallet_explorer_link(address: str) -> str:
+    """Retorna o link correto do explorer"""
+    # Wallet específica usa HyperDash
+    if address == "0x020ca66c30bec2c4fe3861a94e4db4a498a35872":
+        return f"https://hyperdash.io/account/{address}"
+    # Demais usam Hypurrscan
+    return f"https://hypurrscan.io/address/{address}"
 
-async def get_user_fills(address: str) -> list:
-    """Busca histórico de trades de um usuário"""
-    return await fetch_hyperliquid_data("userFills", {"user": address})
-
-async def get_meta_and_asset_ctxs() -> dict:
-    """Busca metadados e contextos de ativos"""
-    return await fetch_hyperliquid_data("metaAndAssetCtxs", {})
-
-# ============================================================================
-# PROCESSAMENTO DE DADOS
-# ============================================================================
-
-def calculate_position_pnl(position: dict, current_price: float) -> dict:
-    """Calcula PnL de uma posição"""
-    try:
-        entry_price = float(position.get("entryPx", 0))
-        size = float(position.get("siz", 0))
-        side = position.get("side", "long").upper()
-        
-        if side == "LONG":
-            pnl = (current_price - entry_price) * size
-        else:
-            pnl = (entry_price - current_price) * size
-        
-        pnl_percentage = (pnl / (entry_price * size)) * 100 if entry_price * size != 0 else 0
-        
-        return {
-            "pnl": round(pnl, 2),
-            "pnl_percentage": round(pnl_percentage, 2)
-        }
-    except:
-        return {"pnl": 0, "pnl_percentage": 0}
-
-def determine_wallet_status(last_activity: datetime) -> str:
-    """Determina status da wallet baseado na última atividade"""
-    now = datetime.now()
-    diff = now - last_activity
+def calculate_risk_level(positions: List[dict]) -> str:
+    """Calcula nível de risco baseado nas posições"""
+    if not positions:
+        return "SAFE"
     
-    if diff < timedelta(minutes=15):
-        return "online"
-    elif diff < timedelta(hours=1):
-        return "warning"
+    total_leverage = sum(pos.get("leverage", 0) for pos in positions)
+    avg_leverage = total_leverage / len(positions)
+    
+    if avg_leverage < 5:
+        return "SAFE"
+    elif avg_leverage < 15:
+        return "MODERATE"
     else:
-        return "offline"
+        return "HIGH"
 
-async def process_whale_data(address: str, nickname: str) -> Optional[WhaleWallet]:
+# ============================================
+# FUNÇÕES DE API HYPERLIQUID
+# ============================================
+
+async def fetch_user_state(address: str) -> dict:
+    """Busca estado do usuário na Hyperliquid"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{HYPERLIQUID_API}/info",
+                json={"type": "clearinghouseState", "user": address}
+            )
+            return response.json() if response.status_code == 200 else {}
+    except Exception as e:
+        print(f"❌ Erro ao buscar estado do usuário {address}: {e}")
+        return {}
+
+async def fetch_user_fills(address: str) -> List[dict]:
+    """Busca histórico de trades"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(
+                f"{HYPERLIQUID_API}/info",
+                json={"type": "userFills", "user": address}
+            )
+            return response.json() if response.status_code == 200 else []
+    except Exception as e:
+        print(f"❌ Erro ao buscar trades de {address}: {e}")
+        return []
+
+async def process_whale_data(address: str) -> WhaleData:
     """Processa dados completos de uma whale"""
     try:
-        # Busca dados do usuário
-        user_state = await get_user_state(address)
-        if not user_state:
-            return None
+        # Busca dados em paralelo
+        state, fills = await asyncio.gather(
+            fetch_user_state(address),
+            fetch_user_fills(address)
+        )
         
-        # Busca preços atuais
-        market_data = await get_meta_and_asset_ctxs()
-        if not market_data:
-            return None
+        # Calcula valores
+        positions = state.get("assetPositions", [])
+        total_value = sum(float(pos.get("position", {}).get("szi", 0)) * 
+                         float(pos.get("position", {}).get("entryPx", 0)) 
+                         for pos in positions)
         
-        # Processa posições
-        positions = user_state.get("assetPositions", [])
-        total_value = 0
-        pnl_24h = 0
-        positions_count = len([p for p in positions if float(p.get("position", {}).get("siz", 0)) != 0])
+        pnl_24h = sum(float(fill.get("closedPnl", 0)) 
+                     for fill in fills[:10] if fill)  # últimos 10 trades
         
-        # Calcula valor total e PnL
-        for pos in positions:
-            position_data = pos.get("position", {})
-            size = float(position_data.get("siz", 0))
-            if size != 0:
-                entry_px = float(position_data.get("entryPx", 0))
-                total_value += abs(size * entry_px)
-                
-                # Aqui você pode calcular PnL real comparando com preço atual
-                # Por enquanto vou usar um valor simulado baseado no unrealized PnL
-                unrealized_pnl = float(position_data.get("unrealizedPnl", 0))
-                pnl_24h += unrealized_pnl
+        last_trade = fills[0].get("time") if fills else None
+        risk_level = calculate_risk_level(positions)
         
-        # Determina última atividade (vamos usar timestamp atual por enquanto)
-        last_activity = datetime.now()
-        status = determine_wallet_status(last_activity)
-        
-        pnl_percentage = (pnl_24h / total_value * 100) if total_value > 0 else 0
-        
-        return WhaleWallet(
+        return WhaleData(
             address=address,
-            nickname=nickname,
-            total_value=round(total_value, 2),
-            pnl_24h=round(pnl_24h, 2),
-            pnl_percentage=round(pnl_percentage, 2),
-            status=status,
-            positions_count=positions_count,
-            last_activity=last_activity.isoformat()
+            nickname=get_whale_nickname(address),
+            total_value=abs(total_value),
+            positions_count=len(positions),
+            pnl_24h=pnl_24h,
+            last_trade=last_trade,
+            risk_level=risk_level,
+            wallet_link=get_wallet_explorer_link(address)
         )
     except Exception as e:
         print(f"❌ Erro ao processar whale {address}: {e}")
-        return None
+        return WhaleData(
+            address=address,
+            nickname=get_whale_nickname(address),
+            total_value=0,
+            positions_count=0,
+            pnl_24h=0,
+            last_trade=None,
+            risk_level="UNKNOWN",
+            wallet_link=get_wallet_explorer_link(address)
+        )
 
-# ============================================================================
-# TAREFA EM BACKGROUND - ATUALIZAÇÃO AUTOMÁTICA
-# ============================================================================
-
-async def update_cache_background():
-    """Atualiza cache automaticamente em background"""
-    while True:
-        try:
-            print("🔄 Atualizando cache...")
-            
-            # Processa cada whale
-            whales = []
-            for i, address in enumerate(KNOWN_WHALES):
-                whale = await process_whale_data(address, f"Whale #{i+1}")
-                if whale:
-                    whales.append(whale)
-            
-            # Atualiza cache
-            cache["whales"] = whales
-            cache["last_update"] = datetime.now().isoformat()
-            
-            print(f"✅ Cache atualizado! {len(whales)} whales processadas")
-            
-        except Exception as e:
-            print(f"❌ Erro ao atualizar cache: {e}")
+async def update_cache():
+    """Atualiza cache com dados das whales"""
+    try:
+        print("🔄 Atualizando cache...")
         
-        # Aguarda antes da próxima atualização
-        await asyncio.sleep(CACHE_DURATION)
+        # Processa todas as whales em paralelo (mais rápido!)
+        tasks = [process_whale_data(addr) for addr in KNOWN_WHALES]
+        results = await asyncio.gather(*tasks)
+        
+        cache["whales"] = results
+        cache["last_update"] = datetime.now(timezone.utc).isoformat()
+        
+        print(f"✅ Cache atualizado! {len(results)} whales processadas")
+        return True
+    except Exception as e:
+        print(f"❌ Erro ao atualizar cache: {e}")
+        return False
+
+# ============================================
+# ENDPOINTS DA API
+# ============================================
 
 @app.on_event("startup")
 async def startup_event():
-    """Inicia tarefa de atualização ao iniciar o servidor"""
-    asyncio.create_task(update_cache_background())
-    print("🚀 Backend iniciado! Sistema de cache ativo.")
-
-# ============================================================================
-# ENDPOINTS DA API
-# ============================================================================
+    """Inicializa o cache ao iniciar"""
+    print("🚀 Iniciando API...")
+    await update_cache()
+    print("✅ API pronta!")
 
 @app.get("/")
 async def root():
-    """Endpoint raiz - informações da API"""
+    """Health check básico"""
     return {
-        "name": "Hyperliquid Whale Tracker API",
-        "version": "1.0.0",
         "status": "online",
-        "last_update": cache["last_update"],
-        "whales_tracked": len(cache["whales"])
+        "message": "Hyperliquid Whale Tracker API",
+        "version": "2.0",
+        "whales_tracked": len(KNOWN_WHALES),
+        "last_update": cache.get("last_update")
     }
 
 @app.get("/api/health")
 async def health_check():
-    """Verifica saúde da API"""
+    """Health check detalhado"""
     return {
         "status": "healthy",
-        "timestamp": datetime.now().isoformat(),
-        "cache_age_seconds": (
-            (datetime.now() - datetime.fromisoformat(cache["last_update"])).seconds
-            if cache["last_update"] else None
-        )
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "cache_status": "active" if cache["whales"] else "empty",
+        "whales_count": len(cache["whales"]),
+        "last_update": cache["last_update"]
     }
 
-@app.get("/api/whales", response_model=List[WhaleWallet])
+@app.get("/api/whales")
 async def get_whales():
-    """Retorna lista de todas as whales monitoradas"""
-    if not cache["whales"]:
-        raise HTTPException(status_code=503, detail="Cache ainda não inicializado. Aguarde alguns segundos.")
+    """Retorna lista de todas as whales"""
+    # Atualiza cache se necessário
+    if not cache["last_update"]:
+        await update_cache()
     
-    return cache["whales"]
+    return {
+        "whales": [whale.dict() for whale in cache["whales"]],
+        "total": len(cache["whales"]),
+        "last_update": cache["last_update"]
+    }
 
 @app.get("/api/whale/{address}")
 async def get_whale_details(address: str):
-    """Retorna detalhes completos de uma whale específica"""
-    # Busca dados frescos da whale
-    whale = await process_whale_data(address, "Custom Whale")
+    """Detalhes de uma whale específica"""
+    if address not in KNOWN_WHALES:
+        raise HTTPException(status_code=404, detail="Whale não encontrada")
     
-    if not whale:
-        raise HTTPException(status_code=404, detail="Whale não encontrada ou erro ao buscar dados")
+    # Busca dados atualizados
+    whale_data = await process_whale_data(address)
     
-    return whale
+    return whale_data.dict()
 
 @app.get("/api/positions/{address}")
-async def get_whale_positions(address: str):
-    """Retorna posições abertas de uma whale"""
+async def get_positions(address: str):
+    """Posições abertas de uma whale"""
     try:
-        user_state = await get_user_state(address)
-        if not user_state:
-            raise HTTPException(status_code=404, detail="Não foi possível buscar posições")
+        state = await fetch_user_state(address)
+        positions = state.get("assetPositions", [])
         
-        positions = []
-        asset_positions = user_state.get("assetPositions", [])
+        formatted_positions = []
+        for pos in positions:
+            position_data = pos.get("position", {})
+            formatted_positions.append({
+                "token": pos.get("coin", "UNKNOWN"),
+                "side": "LONG" if float(position_data.get("szi", 0)) > 0 else "SHORT",
+                "size": abs(float(position_data.get("szi", 0))),
+                "entry_price": float(position_data.get("entryPx", 0)),
+                "current_price": float(position_data.get("liquidationPx", 0)),
+                "pnl": float(position_data.get("unrealizedPnl", 0)),
+                "leverage": float(position_data.get("leverage", {}).get("value", 0)),
+                "liquidation_price": float(position_data.get("liquidationPx", 0))
+            })
         
-        # Busca preços atuais
-        market_data = await get_meta_and_asset_ctxs()
-        prices = {}
-        if market_data and "universe" in market_data:
-            for asset in market_data["universe"]:
-                symbol = asset.get("name")
-                if symbol:
-                    prices[symbol] = float(asset.get("markPx", 0))
-        
-        for asset_pos in asset_positions:
-            position = asset_pos.get("position", {})
-            size = float(position.get("siz", 0))
-            
-            if size != 0:  # Apenas posições abertas
-                symbol = asset_pos.get("position", {}).get("coin", "UNKNOWN")
-                entry_price = float(position.get("entryPx", 0))
-                current_price = prices.get(symbol, entry_price)
-                leverage = float(position.get("leverage", {}).get("value", 1))
-                
-                # Calcula PnL
-                pnl_data = calculate_position_pnl(position, current_price)
-                
-                positions.append(Position(
-                    symbol=symbol,
-                    side="LONG" if size > 0 else "SHORT",
-                    size=abs(size),
-                    entry_price=entry_price,
-                    current_price=current_price,
-                    pnl=pnl_data["pnl"],
-                    pnl_percentage=pnl_data["pnl_percentage"],
-                    leverage=leverage,
-                    liquidation_price=float(position.get("liquidationPx", 0))
-                ))
-        
-        return positions
-    
+        return {"positions": formatted_positions}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar posições: {str(e)}")
 
 @app.get("/api/trades/{address}")
-async def get_whale_trades(address: str, limit: int = 50):
-    """Retorna histórico de trades de uma whale"""
+async def get_trades(address: str):
+    """Histórico de trades de uma whale"""
     try:
-        fills = await get_user_fills(address)
+        fills = await fetch_user_fills(address)
         
-        if not fills:
-            return []
+        formatted_trades = []
+        for fill in fills[:50]:  # últimos 50 trades
+            formatted_trades.append({
+                "timestamp": fill.get("time"),
+                "token": fill.get("coin", "UNKNOWN"),
+                "side": fill.get("side", "UNKNOWN"),
+                "size": float(fill.get("sz", 0)),
+                "price": float(fill.get("px", 0)),
+                "pnl": float(fill.get("closedPnl", 0))
+            })
         
-        trades = []
-        for fill in fills[:limit]:
-            trades.append(Trade(
-                timestamp=datetime.fromtimestamp(fill.get("time", 0) / 1000).isoformat(),
-                symbol=fill.get("coin", "UNKNOWN"),
-                side=fill.get("side", "").upper(),
-                price=float(fill.get("px", 0)),
-                size=float(fill.get("sz", 0)),
-                total_value=float(fill.get("px", 0)) * float(fill.get("sz", 0))
-            ))
-        
-        return trades
-    
+        return {"trades": formatted_trades}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Erro ao buscar trades: {str(e)}")
 
 @app.get("/api/stats")
 async def get_global_stats():
-    """Retorna estatísticas globais do sistema"""
+    """Estatísticas globais de todas as whales"""
     if not cache["whales"]:
-        raise HTTPException(status_code=503, detail="Cache ainda não inicializado")
+        await update_cache()
     
-    total_value = sum(w.total_value for w in cache["whales"])
-    total_pnl = sum(w.pnl_24h for w in cache["whales"])
-    
-    # Conta posições LONG/SHORT
-    long_count = 0
-    short_count = 0
-    
-    for whale in cache["whales"]:
-        # Aqui você pode buscar as posições de cada whale e contar
-        # Por enquanto vou usar valores baseados no total de posições
-        long_count += whale.positions_count // 2
-        short_count += whale.positions_count - (whale.positions_count // 2)
+    total_value = sum(whale.total_value for whale in cache["whales"])
+    total_pnl = sum(whale.pnl_24h for whale in cache["whales"])
+    total_positions = sum(whale.positions_count for whale in cache["whales"])
     
     return {
         "total_whales": len(cache["whales"]),
-        "total_value_tracked": round(total_value, 2),
-        "total_pnl_24h": round(total_pnl, 2),
-        "online_whales": len([w for w in cache["whales"] if w.status == "online"]),
-        "warning_whales": len([w for w in cache["whales"] if w.status == "warning"]),
-        "offline_whales": len([w for w in cache["whales"] if w.status == "offline"]),
-        "long_positions": long_count,
-        "short_positions": short_count,
-        "last_update": cache["last_update"]
+        "total_value": total_value,
+        "total_pnl_24h": total_pnl,
+        "total_positions": total_positions,
+        "average_positions_per_whale": total_positions / len(cache["whales"]) if cache["whales"] else 0
     }
+
+@app.post("/api/whale/add")
+async def add_whale(address: str):
+    """Adiciona nova whale ao monitoramento"""
+    if address in KNOWN_WHALES:
+        raise HTTPException(status_code=400, detail="Whale já está sendo monitorada")
+    
+    KNOWN_WHALES.append(address)
+    await update_cache()
+    
+    return {"message": "Whale adicionada com sucesso!", "address": address}
+
 @app.delete("/api/whale/delete/{address}")
 async def delete_whale(address: str):
     """Remove uma whale do monitoramento"""
     if address not in KNOWN_WHALES:
         raise HTTPException(status_code=404, detail="Whale não encontrada")
     
-    try:
-        KNOWN_WHALES.remove(address)
-        
-        # Remove do cache também
-        cache["whales"] = [w for w in cache["whales"] if w.address != address]
-        
-        return {
-            "message": "Whale removida com sucesso!",
-            "address": address
-        }
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Erro ao remover whale: {str(e)}")
+    KNOWN_WHALES.remove(address)
+    cache["whales"] = [w for w in cache["whales"] if w.address != address]
+    
+    return {"message": "Whale removida com sucesso!", "address": address}
 
-@app.post("/api/whale/add")
-async def add_whale(address: str, nickname: str):
-    """Adiciona uma nova whale para monitoramento"""
-    if address in KNOWN_WHALES:
-        raise HTTPException(status_code=400, detail="Whale já está sendo monitorada")
+@app.post("/api/refresh")
+async def force_refresh():
+    """Força atualização imediata do cache"""
+    success = await update_cache()
     
-    # Testa se a whale existe e tem dados
-    whale = await process_whale_data(address, nickname)
-    if not whale:
-        raise HTTPException(status_code=404, detail="Não foi possível encontrar dados para este endereço")
-    
-    # Adiciona à lista
-    KNOWN_WHALES.append(address)
-    
-    return {
-        "message": "Whale adicionada com sucesso!",
-        "whale": whale
-    }
+    if success:
+        return {"message": "Cache atualizado!", "timestamp": cache["last_update"]}
+    else:
+        raise HTTPException(status_code=500, detail="Erro ao atualizar cache")
 
-# ============================================================================
+# ============================================
 # EXECUÇÃO
-# ============================================================================
+# ============================================
 
 if __name__ == "__main__":
     import uvicorn
