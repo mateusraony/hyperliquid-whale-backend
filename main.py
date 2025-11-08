@@ -46,9 +46,10 @@ CACHE_DURATION = 30  # segundos - atualiza a cada 30s
 
 # Lista de endereços conhecidos de whales (você pode expandir)
 KNOWN_WHALES = [
-    "0x010216dac37c0c81377321d4fdf5bc09f3c6e235",
-    "0x00c9c3391bb8734a8c7e1e4e2f5e0cbd7e1f5ff5",
-    "0x563321ccc9da46d2e9f17a7be5c6753a1d3b3e8f",
+    "0x5b5d51203a0f9079f8aeb098a6523a13F298C060",
+    "0x9e4f6D88f1e34d5F3E96451754a87Aad977Ceff3",
+    "0xbadbb1de95b5f333623ebece7026932fa5039ee6",
+    "0x939f95036D2e7b6d7419Ec072BF9d967352204d2",
 ]
 
 # ============================================================================
