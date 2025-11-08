@@ -406,6 +406,24 @@ async def get_global_stats():
         "short_positions": short_count,
         "last_update": cache["last_update"]
     }
+@app.delete("/api/whale/delete/{address}")
+async def delete_whale(address: str):
+    """Remove uma whale do monitoramento"""
+    if address not in KNOWN_WHALES:
+        raise HTTPException(status_code=404, detail="Whale não encontrada")
+    
+    try:
+        KNOWN_WHALES.remove(address)
+        
+        # Remove do cache também
+        cache["whales"] = [w for w in cache["whales"] if w.address != address]
+        
+        return {
+            "message": "Whale removida com sucesso!",
+            "address": address
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Erro ao remover whale: {str(e)}")
 
 @app.post("/api/whale/add")
 async def add_whale(address: str, nickname: str):
