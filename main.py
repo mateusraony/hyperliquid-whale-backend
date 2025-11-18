@@ -1,15 +1,14 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, List, Dict
+from typing import List, Optional
 import httpx
 import asyncio
 from datetime import datetime
-import os
 
 app = FastAPI(title="Hyperliquid Whale Tracker API")
 
-# CORS
+# Configurar CORS
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,206 +17,260 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lista de endereços das whales reais
-WHALE_ADDRESSES = [
-    "0x010461C14e146ac35Fe42271BDC1134EE31C703a",
-    "0x00c9b566040e0e11b2e5865da9a4bb392955a7d7",
-    "0x04225c49afa2ba00d6a5f9c703cc21bc0bdbb1aa",
-    "0x02c4e503b0867e2bc6e168d38ccc073093f65e85",
-    "0x02c290ce4d0a544a4e60c5aab803bc986f515829",
-    "0x0b08de1e65aaf82dc6398ad6e11f5c1174b6e92e",
-    "0x0bd2cdc7723de453e6e2b2c73f7f4a50cd755ba2",
-    "0x172fd9f9c802feb08f2ff878f5d98f0cd0f17e0f",
-    "0x2041c49938e86dc59f0fc9b12c0febf682413f40",
-    "0x369db618f431f296e0a9d7b4f8c94fe946d3e6cf",
-    "0x547f8c662f3c4f89dedf86e373f554f84f631cda"
+# Lista das 11 whales válidas
+KNOWN_WHALES = [
+    "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182",
+    "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9",
+    "0x939f95036D2e7b6d7419Ec072BF9d967352204d2",
+    "0x3eca9823105034b0d580dd722c75c0c23829a3d9",
+    "0x579f4017263b88945d727a927bf1e3d061fee5ff",
+    "0x9eec98D048D06D9CD75318FFfA3f3960e081daAb",
+    "0x020ca66c30bec2c4fe3861a94e4db4a498a35872",
+    "0xbadbb1de95b5f333623ebece7026932fa5039ee6",
+    "0x9e4f6D88f1e34d5F3E96451754a87Aad977Ceff3",
+    "0x8d0E342E0524392d035Fb37461C6f5813ff59244",
+    "0xC385D2cD1971ADfeD0E47813702765551cAe0372"
 ]
 
-# Armazenamento em memória
-whale_data_cache = {}
-monitoring_active = False
+# Cache para armazenar dados
+cache = {
+    "whales": [],
+    "last_update": None
+}
 
-class WhaleAddress(BaseModel):
+# Modelos Pydantic
+class WhaleData(BaseModel):
     address: str
+    nickname: Optional[str] = None
+    accountValue: float = 0
+    marginUsed: float = 0
+    unrealizedPnl: float = 0
+    liquidationRisk: float = 0
+    positions: List[dict] = []
+    last_updated: Optional[datetime] = None
 
-class MonitoringStatus(BaseModel):
-    active: bool
+class AddWhaleRequest(BaseModel):
+    address: str
+    nickname: Optional[str] = None
 
-# Funções auxiliares
-async def fetch_whale_data(address: str) -> Dict:
-    """Busca dados de uma whale na API do Hyperliquid"""
-    try:
-        async with httpx.AsyncClient(timeout=30.0) as client:
-            # Clearinghouse state
-            response = await client.post(
-                "https://api.hyperliquid.xyz/info",
+# Cliente HTTP com timeout configurado
+async def get_hyperliquid_data(address: str) -> dict:
+    """Busca dados de uma wallet na API da Hyperliquid"""
+    url = "https://api.hyperliquid.xyz/info"
+    
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            # Buscar estado da conta
+            account_state_response = await client.post(
+                url,
                 json={"type": "clearinghouseState", "user": address}
             )
-            data = response.json()
+            account_state_response.raise_for_status()
+            account_data = account_state_response.json()
             
-            # Extrair informações
-            margin_summary = data.get("marginSummary", {})
-            positions = data.get("assetPositions", [])
+            # Processar dados
+            margin_summary = account_data.get("marginSummary", {})
+            asset_positions = account_data.get("assetPositions", [])
             
             # Calcular métricas
             account_value = float(margin_summary.get("accountValue", 0))
-            total_margin_used = float(margin_summary.get("totalMarginUsed", 0))
-            total_ntl_pos = float(margin_summary.get("totalNtlPos", 0))
-            total_raw_usd = float(margin_summary.get("totalRawUsd", 0))
+            margin_used = float(margin_summary.get("totalMarginUsed", 0))
+            unrealized_pnl = float(margin_summary.get("totalNtlPos", 0))
             
-            # PnL
-            unrealized_pnl = total_ntl_pos
+            # Calcular risco de liquidação
+            liquidation_risk = 0
+            if account_value > 0:
+                liquidation_risk = (margin_used / account_value) * 100
             
-            # Posições ativas
-            active_positions = []
-            for pos in positions:
+            # Processar posições
+            positions = []
+            for pos in asset_positions:
                 position_data = pos.get("position", {})
-                if float(position_data.get("szi", 0)) != 0:
-                    active_positions.append({
+                if position_data:
+                    positions.append({
                         "coin": position_data.get("coin", ""),
-                        "size": float(position_data.get("szi", 0)),
-                        "entry_price": float(position_data.get("entryPx", 0)),
-                        "unrealized_pnl": float(position_data.get("unrealizedPnl", 0)),
-                        "leverage": float(position_data.get("leverage", {}).get("value", 0)),
-                        "liquidation_px": float(position_data.get("liquidationPx", 0)) if position_data.get("liquidationPx") else None
+                        "szi": float(position_data.get("szi", 0)),
+                        "unrealizedPnl": float(position_data.get("unrealizedPnl", 0)),
+                        "entryPx": float(position_data.get("entryPx", 0)),
+                        "leverage": position_data.get("leverage", {})
                     })
-            
-            # Risco de liquidação
-            liquidation_risk = "Baixo"
-            if total_margin_used > 0:
-                margin_ratio = (total_margin_used / account_value) * 100 if account_value > 0 else 0
-                if margin_ratio > 80:
-                    liquidation_risk = "Alto"
-                elif margin_ratio > 50:
-                    liquidation_risk = "Médio"
             
             return {
                 "address": address,
-                "account_value": account_value,
-                "total_margin_used": total_margin_used,
-                "unrealized_pnl": unrealized_pnl,
-                "active_positions": active_positions,
-                "liquidation_risk": liquidation_risk,
-                "last_update": datetime.now().isoformat()
+                "accountValue": account_value,
+                "marginUsed": margin_used,
+                "unrealizedPnl": unrealized_pnl,
+                "liquidationRisk": liquidation_risk,
+                "positions": positions,
+                "last_updated": datetime.now().isoformat()
             }
             
-    except Exception as e:
-        print(f"Erro ao buscar dados da whale {address}: {str(e)}")
-        return {
-            "address": address,
-            "error": str(e),
-            "last_update": datetime.now().isoformat()
-        }
+        except httpx.HTTPStatusError as e:
+            print(f"Erro HTTP ao buscar {address}: {e}")
+            return None
+        except httpx.TimeoutException:
+            print(f"Timeout ao buscar {address}")
+            return None
+        except Exception as e:
+            print(f"Erro desconhecido ao buscar {address}: {e}")
+            return None
 
-async def monitor_whales():
-    """Monitora todas as whales continuamente"""
-    global whale_data_cache, monitoring_active
+async def fetch_all_whales():
+    """Busca dados de todas as whales em paralelo"""
+    tasks = [get_hyperliquid_data(address) for address in KNOWN_WHALES]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
     
-    while monitoring_active:
-        tasks = [fetch_whale_data(addr) for addr in WHALE_ADDRESSES]
-        results = await asyncio.gather(*tasks)
-        
-        for result in results:
-            whale_data_cache[result["address"]] = result
-        
-        # Aguardar 30 segundos antes da próxima atualização
-        await asyncio.sleep(30)
+    # Filtrar resultados válidos
+    whales_data = []
+    for result in results:
+        if result and not isinstance(result, Exception):
+            whales_data.append(result)
+    
+    return whales_data
 
-# Endpoints
 @app.get("/")
 async def root():
+    """Endpoint raiz"""
     return {
+        "status": "online",
         "message": "Hyperliquid Whale Tracker API",
-        "version": "1.0",
         "endpoints": {
-            "/whales": "GET - Lista todas as whales monitoradas",
-            "/whales/{address}": "GET - Dados de uma whale específica",
-            "/whales": "POST - Adiciona nova whale",
-            "/whales/{address}": "DELETE - Remove whale",
-            "/monitoring/status": "GET - Status do monitoramento",
-            "/monitoring/start": "POST - Inicia monitoramento",
-            "/monitoring/stop": "POST - Para monitoramento"
-        }
+            "GET /whales": "Listar todas as whales monitoradas",
+            "POST /whales": "Adicionar nova whale",
+            "DELETE /whales/{address}": "Remover whale do monitoramento",
+            "GET /whales/{address}": "Buscar dados de uma whale específica"
+        },
+        "total_whales": len(KNOWN_WHALES)
     }
 
 @app.get("/whales")
 async def get_whales():
-    """Retorna dados de todas as whales"""
-    if not whale_data_cache:
-        # Se cache vazio, buscar dados
-        tasks = [fetch_whale_data(addr) for addr in WHALE_ADDRESSES]
-        results = await asyncio.gather(*tasks)
-        for result in results:
-            whale_data_cache[result["address"]] = result
-    
-    return {"whales": list(whale_data_cache.values()), "count": len(whale_data_cache)}
+    """Retorna dados de todas as whales monitoradas"""
+    try:
+        # Atualizar cache se necessário
+        if not cache["last_update"] or (datetime.now() - cache["last_update"]).seconds > 30:
+            print(f"Buscando dados de {len(KNOWN_WHALES)} whales...")
+            whales_data = await fetch_all_whales()
+            cache["whales"] = whales_data
+            cache["last_update"] = datetime.now()
+            print(f"Cache atualizado: {len(whales_data)} whales com dados")
+        
+        return cache["whales"]
+        
+    except Exception as e:
+        print(f"Erro em /whales: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.get("/whales/{address}")
 async def get_whale(address: str):
     """Retorna dados de uma whale específica"""
-    if address in whale_data_cache:
-        return whale_data_cache[address]
-    
-    # Buscar dados se não estiver em cache
-    data = await fetch_whale_data(address)
-    whale_data_cache[address] = data
-    return data
+    try:
+        # Verificar se a whale está na lista
+        if address not in KNOWN_WHALES:
+            raise HTTPException(status_code=404, detail="Whale não encontrada")
+        
+        # Buscar dados atualizados
+        whale_data = await get_hyperliquid_data(address)
+        
+        if not whale_data:
+            raise HTTPException(status_code=500, detail="Erro ao buscar dados da whale")
+        
+        return whale_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro em /whales/{address}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.post("/whales")
-async def add_whale(whale: WhaleAddress):
-    """Adiciona nova whale para monitoramento"""
-    if whale.address in WHALE_ADDRESSES:
-        raise HTTPException(status_code=400, detail="Whale já está sendo monitorada")
-    
-    WHALE_ADDRESSES.append(whale.address)
-    data = await fetch_whale_data(whale.address)
-    whale_data_cache[whale.address] = data
-    
-    return {"message": "Whale adicionada com sucesso", "whale": data}
+async def add_whale(request: AddWhaleRequest):
+    """Adiciona uma nova whale ao monitoramento"""
+    try:
+        # Validar endereço
+        address = request.address.strip()
+        if not address.startswith("0x") or len(address) != 42:
+            raise HTTPException(
+                status_code=400, 
+                detail="Endereço inválido. Use formato: 0x..."
+            )
+        
+        # Verificar se já existe
+        if address in KNOWN_WHALES:
+            raise HTTPException(
+                status_code=400, 
+                detail="Esta whale já está sendo monitorada"
+            )
+        
+        # Testar se o endereço é válido na Hyperliquid
+        whale_data = await get_hyperliquid_data(address)
+        if not whale_data:
+            raise HTTPException(
+                status_code=400, 
+                detail="Não foi possível buscar dados desta wallet na Hyperliquid"
+            )
+        
+        # Adicionar à lista
+        KNOWN_WHALES.append(address)
+        
+        # Adicionar nickname se fornecido
+        if request.nickname:
+            whale_data["nickname"] = request.nickname
+        
+        # Atualizar cache
+        cache["whales"].append(whale_data)
+        cache["last_update"] = datetime.now()
+        
+        return {
+            "message": "Whale adicionada com sucesso!",
+            "address": address,
+            "nickname": request.nickname,
+            "total_whales": len(KNOWN_WHALES)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro ao adicionar whale: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 @app.delete("/whales/{address}")
 async def delete_whale(address: str):
-    """Remove whale do monitoramento"""
-    if address not in WHALE_ADDRESSES:
-        raise HTTPException(status_code=404, detail="Whale não encontrada")
-    
-    WHALE_ADDRESSES.remove(address)
-    if address in whale_data_cache:
-        del whale_data_cache[address]
-    
-    return {"message": "Whale removida com sucesso", "address": address}
+    """Remove uma whale do monitoramento"""
+    try:
+        # Verificar se existe
+        if address not in KNOWN_WHALES:
+            raise HTTPException(status_code=404, detail="Whale não encontrada")
+        
+        # Remover da lista
+        KNOWN_WHALES.remove(address)
+        
+        # Atualizar cache
+        cache["whales"] = [w for w in cache["whales"] if w.get("address") != address]
+        cache["last_update"] = datetime.now()
+        
+        return {
+            "message": "Whale removida com sucesso!",
+            "address": address,
+            "total_whales": len(KNOWN_WHALES)
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Erro ao remover whale: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
 
-@app.get("/monitoring/status")
-async def get_monitoring_status():
-    """Retorna status do monitoramento"""
+@app.get("/health")
+async def health_check():
+    """Endpoint de health check"""
     return {
-        "active": monitoring_active,
-        "whales_count": len(WHALE_ADDRESSES),
-        "cache_size": len(whale_data_cache)
+        "status": "healthy",
+        "timestamp": datetime.now().isoformat(),
+        "total_whales": len(KNOWN_WHALES),
+        "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None
     }
-
-@app.post("/monitoring/start")
-async def start_monitoring(background_tasks: BackgroundTasks):
-    """Inicia monitoramento contínuo"""
-    global monitoring_active
-    
-    if monitoring_active:
-        return {"message": "Monitoramento já está ativo"}
-    
-    monitoring_active = True
-    background_tasks.add_task(monitor_whales)
-    
-    return {"message": "Monitoramento iniciado", "whales_count": len(WHALE_ADDRESSES)}
-
-@app.post("/monitoring/stop")
-async def stop_monitoring():
-    """Para monitoramento contínuo"""
-    global monitoring_active
-    monitoring_active = False
-    
-    return {"message": "Monitoramento parado"}
 
 if __name__ == "__main__":
     import uvicorn
-    port = int(os.environ.get("PORT", 8000))
-    uvicorn.run(app, host="0.0.0.0", port=port)
+    uvicorn.run(app, host="0.0.0.0", port=8000)
