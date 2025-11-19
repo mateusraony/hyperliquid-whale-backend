@@ -427,7 +427,8 @@ async def root():
             "/whales": "POST - Adiciona nova whale",
             "/whales/{address}": "DELETE - Remove whale",
             "/health": "GET - Status da API",
-            "/telegram/status": "GET - Status dos alertas Telegram"
+            "/telegram/status": "GET - Status dos alertas Telegram",
+            "/telegram/send-resume": "POST - Envia resumo via Telegram"
         }
     }
 
@@ -546,6 +547,66 @@ async def telegram_status():
         "active_orders_tracked": len(alert_state["orders"]),
         "liquidation_warnings_active": len(alert_state["liquidation_warnings"])
     }
+
+# ============================================
+# NOVO: ENDPOINT PARA ENVIAR RESUMO VIA TELEGRAM
+# ============================================
+@app.post("/telegram/send-resume")
+async def send_telegram_resume():
+    """Envia resumo completo via Telegram"""
+    try:
+        # Buscar dados atualizados de todas as whales
+        whales = await fetch_all_whales()
+        
+        # Calcular estatísticas
+        total_value = 0.0
+        total_positions = 0
+        whales_with_positions = 0
+        
+        message_lines = ["📊 <b>RESUMO GERAL - WHALES TRACKER</b>\n"]
+        
+        for whale in whales:
+            if "error" not in whale:
+                positions = whale.get("positions", [])
+                if positions:
+                    whales_with_positions += 1
+                    total_positions += len(positions)
+                    value = whale.get("total_position_value", 0)
+                    total_value += value
+                    
+                    fonte_nome, wallet_link = get_wallet_link(whale["address"])
+                    
+                    message_lines.append(
+                        f"🐋 <b>{whale['nickname']}</b>\n"
+                        f"   Posições: {len(positions)}\n"
+                        f"   Valor: ${value:,.0f}\n"
+                        f"   🔗 {fonte_nome}: {wallet_link}\n"
+                    )
+        
+        # Adicionar totais no início
+        message_lines.insert(1, 
+            f"💰 <b>Total: ${total_value:,.0f}</b>\n"
+            f"🐋 Whales ativas: {whales_with_positions}/{len(KNOWN_WHALES)}\n"
+            f"📊 Posições abertas: {total_positions}\n"
+            f"⏰ {get_brt_time()} BRT\n\n"
+        )
+        
+        message = "\n".join(message_lines)
+        
+        # Enviar via Telegram
+        await telegram_bot.send_message(message)
+        
+        return {
+            "status": "success",
+            "message": "Resumo enviado com sucesso!",
+            "whales_ativas": whales_with_positions,
+            "total_value": total_value,
+            "total_positions": total_positions
+        }
+        
+    except Exception as e:
+        print(f"❌ Erro ao enviar resumo: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
 
 if __name__ == "__main__":
     import uvicorn
