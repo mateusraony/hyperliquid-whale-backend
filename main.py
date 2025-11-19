@@ -1,10 +1,11 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import List, Optional
+from typing import List, Optional, Dict
 import httpx
 import asyncio
 from datetime import datetime
+import os
 
 app = FastAPI(title="Hyperliquid Whale Tracker API")
 
@@ -17,7 +18,16 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Lista das 11 whales válidas
+# ============================================
+# CONFIGURAÇÕES TELEGRAM (VARIÁVEIS DE AMBIENTE)
+# ============================================
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "7530029075:AAHnQtsx0G08J9ARzouaAdH4skimhCBdCUo")
+TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1411468886")
+TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
+
+# ============================================
+# LISTA DAS 11 WHALES VÁLIDAS (NÃO ALTERAR!)
+# ============================================
 KNOWN_WHALES = [
     "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182",
     "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9",
@@ -32,198 +42,438 @@ KNOWN_WHALES = [
     "0xC385D2cD1971ADfeD0E47813702765551cAe0372"
 ]
 
-# Cache para armazenar dados
+# Cache para armazenar dados (NÃO ALTERAR!)
 cache = {
     "whales": [],
     "last_update": None
 }
 
-# Modelos Pydantic
+# ============================================
+# NOVO: SISTEMA DE ALERTAS TELEGRAM
+# ============================================
+
+# Tracking de estados para alertas inteligentes
+alert_state = {
+    "positions": {},  # {address_coin: position_data}
+    "orders": {},     # {address_order: order_data}
+    "liquidation_warnings": set(),  # Posições já alertadas sobre liquidação
+    "last_alert_time": {}  # Controle anti-spam
+}
+
+class TelegramBot:
+    """Cliente Telegram para envio de alertas"""
+    
+    def __init__(self, token: str, chat_id: str):
+        self.token = token
+        self.chat_id = chat_id
+        self.base_url = f"https://api.telegram.org/bot{token}"
+        self.enabled = TELEGRAM_ENABLED
+    
+    async def send_message(self, text: str):
+        """Envia mensagem para o Telegram"""
+        if not self.enabled:
+            print(f"[TELEGRAM DISABLED] {text}")
+            return
+        
+        try:
+            async with httpx.AsyncClient() as client:
+                response = await client.post(
+                    f"{self.base_url}/sendMessage",
+                    json={
+                        "chat_id": self.chat_id,
+                        "text": text,
+                        "parse_mode": "HTML",
+                        "disable_web_page_preview": True
+                    },
+                    timeout=10.0
+                )
+                if response.status_code == 200:
+                    print(f"✅ Alerta enviado: {text[:50]}...")
+                else:
+                    print(f"❌ Erro ao enviar alerta: {response.status_code}")
+        except Exception as e:
+            print(f"❌ Erro Telegram: {str(e)}")
+
+# Instância do bot
+telegram_bot = TelegramBot(TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+
+def get_brt_time():
+    """Retorna horário BRT formatado"""
+    from datetime import timezone, timedelta
+    brt = timezone(timedelta(hours=-3))
+    now = datetime.now(brt)
+    return now.strftime("%d/%m %H:%M:%S")
+
+def get_wallet_link(address: str) -> tuple:
+    """Retorna o link correto da wallet (Hypurrscan ou HyperDash)"""
+    # Wallet especial que usa HyperDash
+    if address == "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182":
+        return ("HyperDash", f"https://hyperdash.io/account/{address}")
+    else:
+        return ("Hypurrscan", f"https://app.hypurrscan.io/address/{address}")
+
+async def check_and_alert_positions(whale_data: dict):
+    """Verifica posições e envia alertas inteligentes"""
+    address = whale_data.get("address")
+    nickname = whale_data.get("nickname", "Whale")
+    positions = whale_data.get("positions", [])
+    
+    fonte_nome, wallet_link = get_wallet_link(address)
+    
+    for position in positions:
+        coin = position.get("coin", "UNKNOWN")
+        pos_key = f"{address}_{coin}"
+        
+        # ===== NOVA POSIÇÃO ABERTA =====
+        if pos_key not in alert_state["positions"]:
+            alert_state["positions"][pos_key] = position
+            
+            side = position.get("side", "").upper()
+            size = abs(float(position.get("szi", 0)))
+            entry = float(position.get("entryPx", 0))
+            leverage = float(position.get("leverage", {}).get("value", 1))
+            position_value = size * entry
+            liquidation_px = float(position.get("liquidationPx", 0))
+            
+            message = f"""
+🟢 <b>POSIÇÃO ABERTA</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'📈 LONG' if side == 'LONG' else '📉 SHORT'}
+
+💰 Tamanho: ${position_value:,.0f}
+🎯 Alavancagem: {leverage:.1f}x
+📍 Entry: ${entry:,.4f}
+💀 Liquidação: ${liquidation_px:,.4f}
+
+⏰ {get_brt_time()} BRT
+            """
+            await telegram_bot.send_message(message.strip())
+        
+        # ===== VERIFICAR RISCO DE LIQUIDAÇÃO (1%) =====
+        else:
+            current_px = float(position.get("positionValue", 0)) / abs(float(position.get("szi", 1)))
+            liquidation_px = float(position.get("liquidationPx", 0))
+            
+            if liquidation_px > 0:
+                distance_pct = abs((current_px - liquidation_px) / current_px) * 100
+                
+                # Alerta apenas 1x quando entrar na zona de 1%
+                if distance_pct <= 1.0 and pos_key not in alert_state["liquidation_warnings"]:
+                    alert_state["liquidation_warnings"].add(pos_key)
+                    
+                    side = position.get("side", "").upper()
+                    coin = position.get("coin", "UNKNOWN")
+                    
+                    message = f"""
+⚠️ <b>RISCO DE LIQUIDAÇÃO</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'📈 LONG' if side == 'LONG' else '📉 SHORT'}
+
+💀 Liquidação: ${liquidation_px:,.4f}
+📍 Preço Atual: ${current_px:,.4f}
+🚨 Distância: {distance_pct:.2f}%
+
+⏰ {get_brt_time()} BRT
+                    """
+                    await telegram_bot.send_message(message.strip())
+                
+                # Remove do warning se sair da zona de perigo
+                elif distance_pct > 2.0 and pos_key in alert_state["liquidation_warnings"]:
+                    alert_state["liquidation_warnings"].discard(pos_key)
+    
+    # ===== POSIÇÃO FECHADA =====
+    stored_positions = {k: v for k, v in alert_state["positions"].items() if k.startswith(address)}
+    current_coins = {pos.get("coin") for pos in positions}
+    
+    for pos_key in list(stored_positions.keys()):
+        coin = pos_key.split("_")[1]
+        if coin not in current_coins:
+            closed_position = alert_state["positions"].pop(pos_key)
+            alert_state["liquidation_warnings"].discard(pos_key)
+            
+            side = closed_position.get("side", "").upper()
+            unrealized_pnl = float(closed_position.get("unrealizedPnl", 0))
+            
+            # Detectar liquidação (estava em warning + perda grande)
+            was_at_risk = pos_key in alert_state["liquidation_warnings"]
+            position_value = abs(float(closed_position.get("szi", 0))) * float(closed_position.get("entryPx", 1))
+            loss_pct = (unrealized_pnl / position_value * 100) if position_value > 0 else 0
+            
+            is_liquidation = was_at_risk and loss_pct < -50
+            
+            if is_liquidation:
+                message = f"""
+💀💀 <b>POSIÇÃO LIQUIDADA</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'📈 LONG' if side == 'LONG' else '📉 SHORT'}
+
+💵 Perda: ${unrealized_pnl:,.2f} ({loss_pct:.1f}%)
+⚡ LIQUIDAÇÃO CONFIRMADA
+
+⏰ {get_brt_time()} BRT
+                """
+            else:
+                emoji = "✅" if unrealized_pnl > 0 else "❌"
+                result = "LUCRO" if unrealized_pnl > 0 else "PREJUÍZO"
+                
+                message = f"""
+{emoji} <b>POSIÇÃO FECHADA</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'📈 LONG' if side == 'LONG' else '📉 SHORT'}
+
+💵 PnL: ${unrealized_pnl:,.2f}
+🎯 Resultado: {result}
+
+⏰ {get_brt_time()} BRT
+                """
+            
+            await telegram_bot.send_message(message.strip())
+
+async def check_and_alert_orders(whale_data: dict):
+    """Verifica orders e envia alertas"""
+    address = whale_data.get("address")
+    nickname = whale_data.get("nickname", "Whale")
+    orders = whale_data.get("orders", [])
+    
+    fonte_nome, wallet_link = get_wallet_link(address)
+    
+    for order in orders:
+        order_id = order.get("oid", "")
+        order_key = f"{address}_{order_id}"
+        
+        # ===== NOVA ORDER CRIADA =====
+        if order_key not in alert_state["orders"]:
+            alert_state["orders"][order_key] = order
+            
+            coin = order.get("coin", "UNKNOWN")
+            side = "COMPRA" if order.get("side") == "B" else "VENDA"
+            size = abs(float(order.get("sz", 0)))
+            limit_px = float(order.get("limitPx", 0))
+            
+            message = f"""
+📝 <b>ORDER CRIADA</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'🟢 ' + side if side == 'COMPRA' else '🔴 ' + side}
+
+💰 Quantidade: {size:,.4f}
+💵 Preço Limite: ${limit_px:,.4f}
+
+⏰ {get_brt_time()} BRT
+            """
+            await telegram_bot.send_message(message.strip())
+    
+    # ===== ORDER CONCLUÍDA/CANCELADA =====
+    stored_orders = {k: v for k, v in alert_state["orders"].items() if k.startswith(address)}
+    current_order_ids = {order.get("oid") for order in orders}
+    
+    for order_key in list(stored_orders.keys()):
+        order_id = order_key.split("_", 1)[1]
+        if order_id not in current_order_ids:
+            closed_order = alert_state["orders"].pop(order_key)
+            
+            coin = closed_order.get("coin", "UNKNOWN")
+            side = "COMPRA" if closed_order.get("side") == "B" else "VENDA"
+            
+            message = f"""
+✅ <b>ORDER CONCLUÍDA/CANCELADA</b>
+
+🐋 Wallet: {nickname}
+🔗 {fonte_nome}: {wallet_link}
+
+📊 Token: <b>{coin}</b>
+{'🟢 ' + side if side == 'COMPRA' else '🔴 ' + side}
+
+⏰ {get_brt_time()} BRT
+            """
+            await telegram_bot.send_message(message.strip())
+
+# ============================================
+# MODELOS PYDANTIC (NÃO ALTERAR!)
+# ============================================
 class WhaleData(BaseModel):
     address: str
     nickname: Optional[str] = None
-    accountValue: float = 0
-    marginUsed: float = 0
-    unrealizedPnl: float = 0
-    liquidationRisk: float = 0
-    positions: List[dict] = []
-    last_updated: Optional[datetime] = None
 
 class AddWhaleRequest(BaseModel):
     address: str
     nickname: Optional[str] = None
 
-# Cliente HTTP com timeout configurado
-async def get_hyperliquid_data(address: str) -> dict:
-    """Busca dados de uma wallet na API da Hyperliquid"""
-    url = "https://api.hyperliquid.xyz/info"
-    
-    async with httpx.AsyncClient(timeout=60.0) as client:
-        try:
-            # Buscar estado da conta
-            account_state_response = await client.post(
-                url,
-                json={"type": "clearinghouseState", "user": address}
+# ============================================
+# FUNÇÕES DE BUSCA DE DADOS (NÃO ALTERAR!)
+# ============================================
+async def fetch_whale_data(address: str, nickname: str = None) -> dict:
+    """Busca dados de uma whale na API Hyperliquid"""
+    try:
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={
+                    "type": "clearinghouseState",
+                    "user": address
+                }
             )
-            account_state_response.raise_for_status()
-            account_data = account_state_response.json()
             
-            # Processar dados
-            margin_summary = account_data.get("marginSummary", {})
-            asset_positions = account_data.get("assetPositions", [])
-            
-            # Calcular métricas
-            account_value = float(margin_summary.get("accountValue", 0))
-            margin_used = float(margin_summary.get("totalMarginUsed", 0))
-            unrealized_pnl = float(margin_summary.get("totalNtlPos", 0))
-            
-            # Calcular risco de liquidação
-            liquidation_risk = 0
-            if account_value > 0:
-                liquidation_risk = (margin_used / account_value) * 100
-            
-            # Processar posições
-            positions = []
-            for pos in asset_positions:
-                position_data = pos.get("position", {})
-                if position_data:
-                    positions.append({
-                        "coin": position_data.get("coin", ""),
-                        "szi": float(position_data.get("szi", 0)),
-                        "unrealizedPnl": float(position_data.get("unrealizedPnl", 0)),
-                        "entryPx": float(position_data.get("entryPx", 0)),
-                        "leverage": position_data.get("leverage", {})
-                    })
-            
-            return {
-                "address": address,
-                "accountValue": account_value,
-                "marginUsed": margin_used,
-                "unrealizedPnl": unrealized_pnl,
-                "liquidationRisk": liquidation_risk,
-                "positions": positions,
-                "last_updated": datetime.now().isoformat()
-            }
-            
-        except httpx.HTTPStatusError as e:
-            print(f"Erro HTTP ao buscar {address}: {e}")
-            return None
-        except httpx.TimeoutException:
-            print(f"Timeout ao buscar {address}")
-            return None
-        except Exception as e:
-            print(f"Erro desconhecido ao buscar {address}: {e}")
-            return None
+            if response.status_code == 200:
+                data = response.json()
+                
+                # Processar posições
+                positions = []
+                if "assetPositions" in data:
+                    for pos in data["assetPositions"]:
+                        if "position" in pos:
+                            p = pos["position"]
+                            positions.append({
+                                "coin": p.get("coin", ""),
+                                "side": p.get("szi", "0")[0] if p.get("szi", "0") else "0",
+                                "size": abs(float(p.get("szi", 0))),
+                                "szi": p.get("szi", "0"),
+                                "entryPx": p.get("entryPx", "0"),
+                                "positionValue": p.get("positionValue", "0"),
+                                "unrealizedPnl": p.get("unrealizedPnl", "0"),
+                                "leverage": p.get("leverage", {}),
+                                "liquidationPx": p.get("liquidationPx", "0")
+                            })
+                
+                # Processar orders
+                orders = []
+                if "openOrders" in data:
+                    for order in data["openOrders"]:
+                        orders.append({
+                            "coin": order.get("coin", ""),
+                            "side": order.get("side", ""),
+                            "sz": order.get("sz", "0"),
+                            "limitPx": order.get("limitPx", "0"),
+                            "oid": order.get("oid", "")
+                        })
+                
+                # Calcular total de posições abertas
+                total_position_value = sum(
+                    abs(float(p.get("positionValue", 0))) 
+                    for p in positions
+                )
+                
+                whale_data = {
+                    "address": address,
+                    "nickname": nickname or f"Whale {address[:6]}",
+                    "positions": positions,
+                    "orders": orders,
+                    "total_positions": len(positions),
+                    "total_orders": len(orders),
+                    "total_position_value": total_position_value,
+                    "last_update": datetime.now().isoformat()
+                }
+                
+                # NOVO: Verificar e enviar alertas
+                await check_and_alert_positions(whale_data)
+                await check_and_alert_orders(whale_data)
+                
+                return whale_data
+            else:
+                return {
+                    "address": address,
+                    "nickname": nickname,
+                    "error": f"API returned {response.status_code}",
+                    "last_update": datetime.now().isoformat()
+                }
+                
+    except Exception as e:
+        print(f"Erro ao buscar dados da whale {address}: {str(e)}")
+        return {
+            "address": address,
+            "nickname": nickname,
+            "error": str(e),
+            "last_update": datetime.now().isoformat()
+        }
 
 async def fetch_all_whales():
     """Busca dados de todas as whales em paralelo"""
-    tasks = [get_hyperliquid_data(address) for address in KNOWN_WHALES]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    # Filtrar resultados válidos
-    whales_data = []
-    for result in results:
-        if result and not isinstance(result, Exception):
-            whales_data.append(result)
-    
-    return whales_data
+    tasks = [fetch_whale_data(addr) for addr in KNOWN_WHALES]
+    results = await asyncio.gather(*tasks)
+    return results
 
+# ============================================
+# ENDPOINTS DA API (NÃO ALTERAR!)
+# ============================================
 @app.get("/")
 async def root():
-    """Endpoint raiz"""
     return {
-        "status": "online",
         "message": "Hyperliquid Whale Tracker API",
+        "version": "2.0",
+        "telegram_enabled": TELEGRAM_ENABLED,
+        "total_whales": len(KNOWN_WHALES),
         "endpoints": {
-            "GET /whales": "Listar todas as whales monitoradas",
-            "POST /whales": "Adicionar nova whale",
-            "DELETE /whales/{address}": "Remover whale do monitoramento",
-            "GET /whales/{address}": "Buscar dados de uma whale específica"
-        },
-        "total_whales": len(KNOWN_WHALES)
+            "/whales": "GET - Lista todas as whales",
+            "/whales/{address}": "GET - Dados de uma whale específica",
+            "/whales": "POST - Adiciona nova whale",
+            "/whales/{address}": "DELETE - Remove whale",
+            "/health": "GET - Status da API",
+            "/telegram/status": "GET - Status dos alertas Telegram"
+        }
     }
 
 @app.get("/whales")
 async def get_whales():
-    """Retorna dados de todas as whales monitoradas"""
-    try:
-        # Atualizar cache se necessário
-        if not cache["last_update"] or (datetime.now() - cache["last_update"]).seconds > 30:
-            print(f"Buscando dados de {len(KNOWN_WHALES)} whales...")
-            whales_data = await fetch_all_whales()
-            cache["whales"] = whales_data
-            cache["last_update"] = datetime.now()
-            print(f"Cache atualizado: {len(whales_data)} whales com dados")
-        
-        return cache["whales"]
-        
-    except Exception as e:
-        print(f"Erro em /whales: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    """Retorna dados de todas as whales"""
+    whales = await fetch_all_whales()
+    cache["whales"] = whales
+    cache["last_update"] = datetime.now()
+    
+    return {
+        "whales": whales,
+        "count": len(whales),
+        "last_update": cache["last_update"].isoformat()
+    }
 
 @app.get("/whales/{address}")
 async def get_whale(address: str):
     """Retorna dados de uma whale específica"""
-    try:
-        # Verificar se a whale está na lista
-        if address not in KNOWN_WHALES:
-            raise HTTPException(status_code=404, detail="Whale não encontrada")
-        
-        # Buscar dados atualizados
-        whale_data = await get_hyperliquid_data(address)
-        
-        if not whale_data:
-            raise HTTPException(status_code=500, detail="Erro ao buscar dados da whale")
-        
-        return whale_data
-        
-    except HTTPException:
-        raise
-    except Exception as e:
-        print(f"Erro em /whales/{address}: {e}")
-        raise HTTPException(status_code=500, detail=str(e))
+    whale_data = await fetch_whale_data(address)
+    return whale_data
 
 @app.post("/whales")
 async def add_whale(request: AddWhaleRequest):
-    """Adiciona uma nova whale ao monitoramento"""
+    """Adiciona nova whale para monitoramento"""
     try:
-        # Validar endereço
-        address = request.address.strip()
-        if not address.startswith("0x") or len(address) != 42:
-            raise HTTPException(
-                status_code=400, 
-                detail="Endereço inválido. Use formato: 0x..."
-            )
+        # Validar formato do endereço
+        if not request.address.startswith("0x") or len(request.address) != 42:
+            raise HTTPException(status_code=400, detail="Endereço inválido. Use formato 0x...")
         
         # Verificar se já existe
-        if address in KNOWN_WHALES:
-            raise HTTPException(
-                status_code=400, 
-                detail="Esta whale já está sendo monitorada"
-            )
+        if request.address in KNOWN_WHALES:
+            raise HTTPException(status_code=400, detail="Whale já está sendo monitorada")
         
-        # Testar se o endereço é válido na Hyperliquid
-        whale_data = await get_hyperliquid_data(address)
-        if not whale_data:
-            raise HTTPException(
-                status_code=400, 
-                detail="Não foi possível buscar dados desta wallet na Hyperliquid"
-            )
+        # Testar se o endereço existe na Hyperliquid
+        test_data = await fetch_whale_data(request.address, request.nickname)
+        
+        if "error" in test_data:
+            raise HTTPException(status_code=400, detail=f"Erro ao buscar whale: {test_data['error']}")
         
         # Adicionar à lista
-        KNOWN_WHALES.append(address)
-        
-        # Adicionar nickname se fornecido
-        if request.nickname:
-            whale_data["nickname"] = request.nickname
-        
-        # Atualizar cache
-        cache["whales"].append(whale_data)
-        cache["last_update"] = datetime.now()
+        KNOWN_WHALES.append(request.address)
         
         return {
             "message": "Whale adicionada com sucesso!",
-            "address": address,
+            "address": request.address,
             "nickname": request.nickname,
             "total_whales": len(KNOWN_WHALES)
         }
@@ -244,6 +494,16 @@ async def delete_whale(address: str):
         
         # Remover da lista
         KNOWN_WHALES.remove(address)
+        
+        # Limpar estados de alerta relacionados
+        keys_to_remove = [k for k in alert_state["positions"].keys() if k.startswith(address)]
+        for key in keys_to_remove:
+            alert_state["positions"].pop(key, None)
+            alert_state["liquidation_warnings"].discard(key)
+        
+        keys_to_remove = [k for k in alert_state["orders"].keys() if k.startswith(address)]
+        for key in keys_to_remove:
+            alert_state["orders"].pop(key, None)
         
         # Atualizar cache
         cache["whales"] = [w for w in cache["whales"] if w.get("address") != address]
@@ -268,7 +528,23 @@ async def health_check():
         "status": "healthy",
         "timestamp": datetime.now().isoformat(),
         "total_whales": len(KNOWN_WHALES),
+        "telegram_enabled": TELEGRAM_ENABLED,
         "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None
+    }
+
+# ============================================
+# NOVO: ENDPOINT DE STATUS DO TELEGRAM
+# ============================================
+@app.get("/telegram/status")
+async def telegram_status():
+    """Retorna status dos alertas Telegram"""
+    return {
+        "enabled": TELEGRAM_ENABLED,
+        "bot_token_configured": bool(TELEGRAM_BOT_TOKEN),
+        "chat_id_configured": bool(TELEGRAM_CHAT_ID),
+        "active_positions_tracked": len(alert_state["positions"]),
+        "active_orders_tracked": len(alert_state["orders"]),
+        "liquidation_warnings_active": len(alert_state["liquidation_warnings"])
     }
 
 if __name__ == "__main__":
