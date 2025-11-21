@@ -28,19 +28,20 @@ TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 # ============================================
 # LISTA DAS 11 WHALES VÁLIDAS (NÃO ALTERAR!)
 # ============================================
-KNOWN_WHALES = [
-    "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182",
-    "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9",
-    "0x939f95036D2e7b6d7419Ec072BF9d967352204d2",
-    "0x3eca9823105034b0d580dd722c75c0c23829a3d9",
-    "0x579f4017263b88945d727a927bf1e3d061fee5ff",
-    "0x9eec98D048D06D9CD75318FFfA3f3960e081daAb",
-    "0x020ca66c30bec2c4fe3861a94e4db4a498a35872",
-    "0xbadbb1de95b5f333623ebece7026932fa5039ee6",
-    "0x9e4f6D88f1e34d5F3E96451754a87Aad977Ceff3",
-    "0x8d0E342E0524392d035Fb37461C6f5813ff59244",
-    "0xC385D2cD1971ADfeD0E47813702765551cAe0372"
-]
+# Estrutura: {address: nickname}
+KNOWN_WHALES = {
+    "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182": "Whale 0x0104",
+    "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9": "Whale 0x8c58",
+    "0x939f95036D2e7b6d7419Ec072BF9d967352204d2": "Whale 0x939f",
+    "0x3eca9823105034b0d580dd722c75c0c23829a3d9": "Whale 0x3eca",
+    "0x579f4017263b88945d727a927bf1e3d061fee5ff": "Whale 0x579f",
+    "0x9eec98D048D06D9CD75318FFfA3f3960e081daAb": "Whale 0x9eec",
+    "0x020ca66c30bec2c4fe3861a94e4db4a498a35872": "Whale 0x020c",
+    "0xbadbb1de95b5f333623ebece7026932fa5039ee6": "Whale 0xbadb",
+    "0x9e4f6D88f1e34d5F3E96451754a87Aad977Ceff3": "Whale 0x9e4f",
+    "0x8d0E342E0524392d035Fb37461C6f5813ff59244": "Whale 0x8d0E",
+    "0xC385D2cD1971ADfeD0E47813702765551cAe0372": "Whale 0xC385"
+}
 
 # Cache para armazenar dados (NÃO ALTERAR!)
 cache = {
@@ -131,7 +132,7 @@ def get_wallet_link(address: str) -> tuple:
     if address == "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182":
         return ("HyperDash", f"https://hyperdash.io/account/{address}")
     else:
-        return ("Hypurrscan", f"https://app.hypurrscan.io/address/{address}")
+        return ("Hypurrscan", f"https://hypurrscan.io/address/{address}")
 
 async def check_and_alert_positions(whale_data: dict):
     """Verifica posições e envia alertas inteligentes"""
@@ -398,9 +399,13 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
                     for p in positions
                 )
                 
+                # Usar nickname do dicionário KNOWN_WHALES se não for passado
+                if not nickname:
+                    nickname = KNOWN_WHALES.get(address, f"Whale {address[:6]}")
+                
                 whale_data = {
                     "address": address,
-                    "nickname": nickname or f"Whale {address[:6]}",
+                    "nickname": nickname,
                     "positions": positions,
                     "orders": orders,
                     "total_positions": len(positions),
@@ -417,7 +422,7 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
             else:
                 return {
                     "address": address,
-                    "nickname": nickname,
+                    "nickname": nickname or KNOWN_WHALES.get(address, f"Whale {address[:6]}"),
                     "error": f"API returned {response.status_code}",
                     "last_update": datetime.now().isoformat()
                 }
@@ -426,14 +431,14 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
         print(f"Erro ao buscar dados da whale {address}: {str(e)}")
         return {
             "address": address,
-            "nickname": nickname,
+            "nickname": nickname or KNOWN_WHALES.get(address, f"Whale {address[:6]}"),
             "error": str(e),
             "last_update": datetime.now().isoformat()
         }
 
 async def fetch_all_whales():
     """Busca dados de todas as whales em paralelo"""
-    tasks = [fetch_whale_data(addr) for addr in KNOWN_WHALES]
+    tasks = [fetch_whale_data(addr, nickname) for addr, nickname in KNOWN_WHALES.items()]
     results = await asyncio.gather(*tasks)
     return results
 
@@ -490,18 +495,19 @@ async def add_whale(request: AddWhaleRequest):
             raise HTTPException(status_code=400, detail="Whale já está sendo monitorada")
         
         # Testar se o endereço existe na Hyperliquid
-        test_data = await fetch_whale_data(request.address, request.nickname)
+        test_nickname = request.nickname or f"Whale {request.address[:6]}"
+        test_data = await fetch_whale_data(request.address, test_nickname)
         
         if "error" in test_data:
             raise HTTPException(status_code=400, detail=f"Erro ao buscar whale: {test_data['error']}")
         
-        # Adicionar à lista
-        KNOWN_WHALES.append(request.address)
+        # Adicionar ao dicionário com nickname
+        KNOWN_WHALES[request.address] = test_nickname
         
         return {
             "message": "Whale adicionada com sucesso!",
             "address": request.address,
-            "nickname": request.nickname,
+            "nickname": test_nickname,
             "total_whales": len(KNOWN_WHALES)
         }
         
@@ -519,8 +525,8 @@ async def delete_whale(address: str):
         if address not in KNOWN_WHALES:
             raise HTTPException(status_code=404, detail="Whale não encontrada")
         
-        # Remover da lista
-        KNOWN_WHALES.remove(address)
+        # Remover do dicionário
+        removed_nickname = KNOWN_WHALES.pop(address)
         
         # Limpar estados de alerta relacionados
         keys_to_remove = [k for k in alert_state["positions"].keys() if k.startswith(address)]
@@ -539,6 +545,7 @@ async def delete_whale(address: str):
         return {
             "message": "Whale removida com sucesso!",
             "address": address,
+            "nickname": removed_nickname,
             "total_whales": len(KNOWN_WHALES)
         }
         
