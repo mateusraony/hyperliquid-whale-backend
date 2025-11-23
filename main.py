@@ -6,6 +6,14 @@ import httpx
 import asyncio
 from datetime import datetime
 import os
+import json
+from pathlib import Path
+
+# ============================================
+# NOVO: APSCHEDULER PARA MONITORAMENTO 24/7
+# ============================================
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+from apscheduler.triggers.interval import IntervalTrigger
 
 app = FastAPI(title="Hyperliquid Whale Tracker API")
 
@@ -26,10 +34,12 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID", "1411468886")
 TELEGRAM_ENABLED = os.getenv("TELEGRAM_ENABLED", "true").lower() == "true"
 
 # ============================================
-# LISTA DAS 11 WHALES VÁLIDAS (NÃO ALTERAR!)
+# NOVO: PERSISTÊNCIA DE NICKNAMES EM JSON
 # ============================================
-# Estrutura: {address: nickname}
-KNOWN_WHALES = {
+WHALES_FILE = Path("whales_data.json")
+
+# Lista inicial das 11 whales
+DEFAULT_WHALES = {
     "0x010461DBc33f87b1a0f765bcAc2F96F4B3936182": "Whale 0x0104",
     "0x8c5865689EABe45645fa034e53d0c9995DCcb9c9": "Whale 0x8c58",
     "0x939f95036D2e7b6d7419Ec072BF9d967352204d2": "Whale 0x939f",
@@ -43,14 +53,42 @@ KNOWN_WHALES = {
     "0xC385D2cD1971ADfeD0E47813702765551cAe0372": "Whale 0xC385"
 }
 
-# Cache para armazenar dados (NÃO ALTERAR!)
+def load_whales() -> dict:
+    """Carrega whales do arquivo JSON ou retorna padrão"""
+    if WHALES_FILE.exists():
+        try:
+            with open(WHALES_FILE, 'r') as f:
+                data = json.load(f)
+                print(f"✅ Carregadas {len(data)} whales do arquivo")
+                return data
+        except Exception as e:
+            print(f"⚠️ Erro ao carregar whales: {e}. Usando padrão.")
+            return DEFAULT_WHALES.copy()
+    else:
+        print("📝 Criando arquivo de whales pela primeira vez")
+        save_whales(DEFAULT_WHALES)
+        return DEFAULT_WHALES.copy()
+
+def save_whales(whales_dict: dict):
+    """Salva whales no arquivo JSON"""
+    try:
+        with open(WHALES_FILE, 'w') as f:
+            json.dump(whales_dict, f, indent=2)
+        print(f"💾 Salvas {len(whales_dict)} whales no arquivo")
+    except Exception as e:
+        print(f"❌ Erro ao salvar whales: {e}")
+
+# Carregar whales ao iniciar
+KNOWN_WHALES = load_whales()
+
+# Cache para armazenar dados
 cache = {
     "whales": [],
     "last_update": None
 }
 
 # ============================================
-# NOVO: FUNÇÕES AUXILIARES SAFE (PREVENIR ERROS DE NONE)
+# FUNÇÕES AUXILIARES SAFE (PREVENIR ERROS DE NONE)
 # ============================================
 def safe_float(value, default=0.0):
     """Converte valor para float de forma segura"""
@@ -71,7 +109,7 @@ def safe_int(value, default=0):
         return default
 
 # ============================================
-# NOVO: SISTEMA DE ALERTAS TELEGRAM
+# SISTEMA DE ALERTAS TELEGRAM
 # ============================================
 
 # Tracking de estados para alertas inteligentes
@@ -94,7 +132,7 @@ class TelegramBot:
     async def send_message(self, text: str):
         """Envia mensagem para o Telegram"""
         if not self.enabled:
-            print(f"[TELEGRAM DISABLED] {text}")
+            print(f"[TELEGRAM DISABLED] {text[:50]}...")
             return
         
         try:
@@ -151,12 +189,12 @@ async def check_and_alert_positions(whale_data: dict):
             alert_state["positions"][pos_key] = position
             
             side = position.get("side", "").upper()
-            size = abs(safe_float(position.get("szi", 0)))  # SAFE_FLOAT
-            entry = safe_float(position.get("entryPx", 0))  # SAFE_FLOAT
+            size = abs(safe_float(position.get("szi", 0)))
+            entry = safe_float(position.get("entryPx", 0))
             leverage_data = position.get("leverage", {})
-            leverage = safe_float(leverage_data.get("value", 1))  # SAFE_FLOAT
+            leverage = safe_float(leverage_data.get("value", 1))
             position_value = size * entry
-            liquidation_px = safe_float(position.get("liquidationPx", 0))  # SAFE_FLOAT
+            liquidation_px = safe_float(position.get("liquidationPx", 0))
             
             message = f"""
 🟢 <b>POSIÇÃO ABERTA</b>
@@ -178,10 +216,10 @@ async def check_and_alert_positions(whale_data: dict):
         
         # ===== VERIFICAR RISCO DE LIQUIDAÇÃO (1%) =====
         else:
-            position_value = safe_float(position.get("positionValue", 0))  # SAFE_FLOAT
-            szi = safe_float(position.get("szi", 1))  # SAFE_FLOAT
+            position_value = safe_float(position.get("positionValue", 0))
+            szi = safe_float(position.get("szi", 1))
             current_px = position_value / abs(szi) if szi != 0 else 0
-            liquidation_px = safe_float(position.get("liquidationPx", 0))  # SAFE_FLOAT
+            liquidation_px = safe_float(position.get("liquidationPx", 0))
             
             if liquidation_px > 0:
                 distance_pct = abs((current_px - liquidation_px) / current_px) * 100 if current_px > 0 else 100
@@ -225,12 +263,12 @@ async def check_and_alert_positions(whale_data: dict):
             alert_state["liquidation_warnings"].discard(pos_key)
             
             side = closed_position.get("side", "").upper()
-            unrealized_pnl = safe_float(closed_position.get("unrealizedPnl", 0))  # SAFE_FLOAT
+            unrealized_pnl = safe_float(closed_position.get("unrealizedPnl", 0))
             
             # Detectar liquidação (estava em warning + perda grande)
             was_at_risk = pos_key in alert_state["liquidation_warnings"]
-            szi_value = safe_float(closed_position.get("szi", 0))  # SAFE_FLOAT
-            entry_px = safe_float(closed_position.get("entryPx", 1))  # SAFE_FLOAT
+            szi_value = safe_float(closed_position.get("szi", 0))
+            entry_px = safe_float(closed_position.get("entryPx", 1))
             position_value = abs(szi_value) * entry_px
             loss_pct = (unrealized_pnl / position_value * 100) if position_value > 0 else 0
             
@@ -290,8 +328,8 @@ async def check_and_alert_orders(whale_data: dict):
             
             coin = order.get("coin", "UNKNOWN")
             side = "COMPRA" if order.get("side") == "B" else "VENDA"
-            size = abs(safe_float(order.get("sz", 0)))  # SAFE_FLOAT
-            limit_px = safe_float(order.get("limitPx", 0))  # SAFE_FLOAT
+            size = abs(safe_float(order.get("sz", 0)))
+            limit_px = safe_float(order.get("limitPx", 0))
             
             message = f"""
 📝 <b>ORDER CRIADA</b>
@@ -335,7 +373,7 @@ async def check_and_alert_orders(whale_data: dict):
             await telegram_bot.send_message(message.strip())
 
 # ============================================
-# MODELOS PYDANTIC (NÃO ALTERAR!)
+# MODELOS PYDANTIC
 # ============================================
 class WhaleData(BaseModel):
     address: str
@@ -346,7 +384,7 @@ class AddWhaleRequest(BaseModel):
     nickname: Optional[str] = None
 
 # ============================================
-# FUNÇÕES DE BUSCA DE DADOS (NÃO ALTERAR!)
+# FUNÇÕES DE BUSCA DE DADOS
 # ============================================
 async def fetch_whale_data(address: str, nickname: str = None) -> dict:
     """Busca dados de uma whale na API Hyperliquid"""
@@ -372,7 +410,7 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
                             positions.append({
                                 "coin": p.get("coin", ""),
                                 "side": p.get("szi", "0")[0] if p.get("szi", "0") else "0",
-                                "size": abs(safe_float(p.get("szi", 0))),  # SAFE_FLOAT
+                                "size": abs(safe_float(p.get("szi", 0))),
                                 "szi": p.get("szi", "0"),
                                 "entryPx": p.get("entryPx", "0"),
                                 "positionValue": p.get("positionValue", "0"),
@@ -393,7 +431,7 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
                             "oid": order.get("oid", "")
                         })
                 
-                # Calcular total de posições abertas - COM SAFE_FLOAT
+                # Calcular total de posições abertas
                 total_position_value = sum(
                     abs(safe_float(p.get("positionValue", 0)))
                     for p in positions
@@ -414,7 +452,7 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
                     "last_update": datetime.now().isoformat()
                 }
                 
-                # NOVO: Verificar e enviar alertas
+                # Verificar e enviar alertas
                 await check_and_alert_positions(whale_data)
                 await check_and_alert_orders(whale_data)
                 
@@ -443,21 +481,40 @@ async def fetch_all_whales():
     return results
 
 # ============================================
-# ENDPOINTS DA API (NÃO ALTERAR!)
+# NOVO: MONITORAMENTO AUTOMÁTICO 24/7
+# ============================================
+async def monitor_whales_job():
+    """Job que roda a cada 30 segundos monitorando as whales"""
+    try:
+        print(f"🔄 [{get_brt_time()}] Monitorando whales automaticamente...")
+        whales = await fetch_all_whales()
+        cache["whales"] = whales
+        cache["last_update"] = datetime.now()
+        print(f"✅ [{get_brt_time()}] Monitoramento concluído: {len(whales)} whales")
+    except Exception as e:
+        print(f"❌ [{get_brt_time()}] Erro no monitoramento: {str(e)}")
+
+# Criar scheduler
+scheduler = AsyncIOScheduler()
+
+# ============================================
+# ENDPOINTS DA API
 # ============================================
 @app.get("/")
 async def root():
     return {
         "message": "Hyperliquid Whale Tracker API",
-        "version": "2.0",
+        "version": "2.1",
         "telegram_enabled": TELEGRAM_ENABLED,
         "total_whales": len(KNOWN_WHALES),
+        "scheduler_running": scheduler.running,
         "endpoints": {
             "/whales": "GET - Lista todas as whales",
             "/whales/{address}": "GET - Dados de uma whale específica",
             "/whales": "POST - Adiciona nova whale",
             "/whales/{address}": "DELETE - Remove whale",
             "/health": "GET - Status da API",
+            "/keep-alive": "GET - Mantém serviço ativo",
             "/telegram/status": "GET - Status dos alertas Telegram",
             "/telegram/send-resume": "POST - Envia resumo via Telegram"
         }
@@ -504,6 +561,9 @@ async def add_whale(request: AddWhaleRequest):
         # Adicionar ao dicionário com nickname
         KNOWN_WHALES[request.address] = test_nickname
         
+        # NOVO: Salvar no arquivo JSON
+        save_whales(KNOWN_WHALES)
+        
         return {
             "message": "Whale adicionada com sucesso!",
             "address": request.address,
@@ -527,6 +587,9 @@ async def delete_whale(address: str):
         
         # Remover do dicionário
         removed_nickname = KNOWN_WHALES.pop(address)
+        
+        # NOVO: Salvar no arquivo JSON
+        save_whales(KNOWN_WHALES)
         
         # Limpar estados de alerta relacionados
         keys_to_remove = [k for k in alert_state["positions"].keys() if k.startswith(address)]
@@ -563,11 +626,26 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "total_whales": len(KNOWN_WHALES),
         "telegram_enabled": TELEGRAM_ENABLED,
+        "scheduler_running": scheduler.running,
         "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None
     }
 
 # ============================================
-# NOVO: ENDPOINT DE STATUS DO TELEGRAM
+# NOVO: ENDPOINT KEEP-ALIVE (EVITA HIBERNAÇÃO)
+# ============================================
+@app.get("/keep-alive")
+async def keep_alive():
+    """Endpoint para manter o serviço ativo (cron-job.org pinga a cada 10min)"""
+    return {
+        "status": "alive",
+        "timestamp": datetime.now().isoformat(),
+        "scheduler_running": scheduler.running,
+        "total_whales": len(KNOWN_WHALES),
+        "message": "Serviço ativo e monitorando!"
+    }
+
+# ============================================
+# ENDPOINT DE STATUS DO TELEGRAM
 # ============================================
 @app.get("/telegram/status")
 async def telegram_status():
@@ -578,11 +656,12 @@ async def telegram_status():
         "chat_id_configured": bool(TELEGRAM_CHAT_ID),
         "active_positions_tracked": len(alert_state["positions"]),
         "active_orders_tracked": len(alert_state["orders"]),
-        "liquidation_warnings_active": len(alert_state["liquidation_warnings"])
+        "liquidation_warnings_active": len(alert_state["liquidation_warnings"]),
+        "scheduler_running": scheduler.running
     }
 
 # ============================================
-# NOVO: ENDPOINT PARA ENVIAR RESUMO VIA TELEGRAM
+# ENDPOINT PARA ENVIAR RESUMO VIA TELEGRAM
 # ============================================
 @app.post("/telegram/send-resume")
 async def send_telegram_resume():
@@ -604,7 +683,7 @@ async def send_telegram_resume():
                 if positions:
                     whales_with_positions += 1
                     total_positions += len(positions)
-                    value = safe_float(whale.get("total_position_value", 0))  # SAFE_FLOAT
+                    value = safe_float(whale.get("total_position_value", 0))
                     total_value += value
                     
                     fonte_nome, wallet_link = get_wallet_link(whale["address"])
@@ -640,6 +719,43 @@ async def send_telegram_resume():
     except Exception as e:
         print(f"❌ Erro ao enviar resumo: {str(e)}")
         raise HTTPException(status_code=500, detail=str(e))
+
+# ============================================
+# NOVO: STARTUP E SHUTDOWN EVENTS
+# ============================================
+@app.on_event("startup")
+async def startup_event():
+    """Inicializa o scheduler ao subir a aplicação"""
+    print("🚀 ============================================")
+    print("🚀 INICIANDO HYPERLIQUID WHALE TRACKER API")
+    print("🚀 ============================================")
+    print(f"📊 Total de whales carregadas: {len(KNOWN_WHALES)}")
+    print(f"📱 Telegram habilitado: {TELEGRAM_ENABLED}")
+    
+    # Adicionar job de monitoramento a cada 30 segundos
+    scheduler.add_job(
+        monitor_whales_job,
+        trigger=IntervalTrigger(seconds=30),
+        id='monitor_whales',
+        name='Monitorar whales a cada 30s',
+        replace_existing=True
+    )
+    
+    # Iniciar scheduler
+    scheduler.start()
+    print("✅ Scheduler iniciado! Monitoramento 24/7 ativo.")
+    print("⏰ Monitoramento automático a cada 30 segundos")
+    print("🚀 ============================================\n")
+    
+    # Executar primeira verificação imediatamente
+    await monitor_whales_job()
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Para o scheduler ao desligar a aplicação"""
+    print("\n🛑 Desligando scheduler...")
+    scheduler.shutdown()
+    print("✅ Scheduler desligado com sucesso!")
 
 if __name__ == "__main__":
     import uvicorn
