@@ -15,6 +15,11 @@ from pathlib import Path
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.interval import IntervalTrigger
 
+# ============================================
+# NOVO FASE 4: IMPORTAR MÓDULO DE BANCO DE DADOS
+# ============================================
+import database as db
+
 app = FastAPI(title="Hyperliquid Whale Tracker API")
 
 # Configurar CORS
@@ -84,7 +89,8 @@ KNOWN_WHALES = load_whales()
 # Cache para armazenar dados
 cache = {
     "whales": [],
-    "last_update": None
+    "last_update": None,
+    "metrics": {}  # NOVO: Cache de métricas calculadas
 }
 
 # ============================================
@@ -213,6 +219,9 @@ async def check_and_alert_positions(whale_data: dict):
 ⏰ {get_brt_time()} BRT
 """
             await telegram_bot.send_message(message.strip())
+            
+            # ===== NOVO FASE 4: SALVAR NO BANCO =====
+            await db.save_open_trade(address, nickname, position)
         
         # ===== VERIFICAR RISCO DE LIQUIDAÇÃO (1%) =====
         else:
@@ -289,6 +298,8 @@ async def check_and_alert_positions(whale_data: dict):
 
 ⏰ {get_brt_time()} BRT
 """
+                # ===== NOVO FASE 4: SALVAR LIQUIDAÇÃO =====
+                await db.save_liquidation(address, nickname, closed_position, unrealized_pnl)
             else:
                 emoji = "✅" if unrealized_pnl > 0 else "❌"
                 result = "LUCRO" if unrealized_pnl > 0 else "PREJUÍZO"
@@ -307,6 +318,10 @@ async def check_and_alert_positions(whale_data: dict):
 
 ⏰ {get_brt_time()} BRT
 """
+                # ===== NOVO FASE 4: FECHAR TRADE NO BANCO =====
+                # Calcular exit_price aproximado
+                exit_price = entry_px * (1 + unrealized_pnl / position_value) if position_value > 0 else entry_px
+                await db.close_trade(address, coin, exit_price, unrealized_pnl)
             
             await telegram_bot.send_message(message.strip())
 
@@ -481,6 +496,59 @@ async def fetch_all_whales():
     return results
 
 # ============================================
+# NOVO FASE 4: CALCULAR MÉTRICAS REAIS
+# ============================================
+async def calculate_real_metrics(current_whales_data: list) -> dict:
+    """Calcula métricas reais baseadas no banco de dados"""
+    try:
+        # Win Rate
+        win_rate_data = await db.calculate_win_rate()
+        
+        # Sharpe Ratio
+        sharpe_data = await db.calculate_sharpe_ratio()
+        
+        # Portfolio Heat
+        portfolio_heat = await db.calculate_portfolio_heat(current_whales_data)
+        
+        # Liquidações
+        liquidations_1d = await db.get_liquidations_count(1)
+        liquidations_1w = await db.get_liquidations_count(7)
+        liquidations_1m = await db.get_liquidations_count(30)
+        
+        metrics = {
+            "win_rate_global": win_rate_data.get("global", 0.0),
+            "win_rate_long": win_rate_data.get("long", 0.0),
+            "win_rate_short": win_rate_data.get("short", 0.0),
+            "total_trades_analyzed": win_rate_data.get("total_trades", 0),
+            "sharpe_ratio": sharpe_data.get("sharpe_ratio", 0.0),
+            "sharpe_message": sharpe_data.get("message", ""),
+            "portfolio_heat": portfolio_heat,
+            "liquidations_1d": liquidations_1d,
+            "liquidations_1w": liquidations_1w,
+            "liquidations_1m": liquidations_1m,
+            "last_calculated": datetime.now().isoformat()
+        }
+        
+        return metrics
+        
+    except Exception as e:
+        print(f"❌ Erro ao calcular métricas reais: {e}")
+        # Retornar métricas mockadas em caso de erro
+        return {
+            "win_rate_global": 0.0,
+            "win_rate_long": 0.0,
+            "win_rate_short": 0.0,
+            "total_trades_analyzed": 0,
+            "sharpe_ratio": 0.0,
+            "sharpe_message": "Database error",
+            "portfolio_heat": 0.0,
+            "liquidations_1d": 0,
+            "liquidations_1w": 0,
+            "liquidations_1m": 0,
+            "error": str(e)
+        }
+
+# ============================================
 # NOVO: MONITORAMENTO AUTOMÁTICO 24/7
 # ============================================
 async def monitor_whales_job():
@@ -490,6 +558,11 @@ async def monitor_whales_job():
         whales = await fetch_all_whales()
         cache["whales"] = whales
         cache["last_update"] = datetime.now()
+        
+        # NOVO FASE 4: Calcular métricas reais
+        metrics = await calculate_real_metrics(whales)
+        cache["metrics"] = metrics
+        
         print(f"✅ [{get_brt_time()}] Monitoramento concluído: {len(whales)} whales")
     except Exception as e:
         print(f"❌ [{get_brt_time()}] Erro no monitoramento: {str(e)}")
@@ -504,32 +577,40 @@ scheduler = AsyncIOScheduler()
 async def root():
     return {
         "message": "Hyperliquid Whale Tracker API",
-        "version": "2.1",
+        "version": "3.0 - FASE 4",
         "telegram_enabled": TELEGRAM_ENABLED,
+        "database_enabled": db.db_pool is not None,
         "total_whales": len(KNOWN_WHALES),
         "scheduler_running": scheduler.running,
         "endpoints": {
-            "/whales": "GET - Lista todas as whales",
+            "/whales": "GET - Lista todas as whales com métricas reais",
             "/whales/{address}": "GET - Dados de uma whale específica",
             "/whales": "POST - Adiciona nova whale",
             "/whales/{address}": "DELETE - Remove whale",
             "/health": "GET - Status da API",
             "/keep-alive": "GET - Mantém serviço ativo",
             "/telegram/status": "GET - Status dos alertas Telegram",
-            "/telegram/send-resume": "POST - Envia resumo via Telegram"
+            "/telegram/send-resume": "POST - Envia resumo via Telegram",
+            "/api/database/health": "GET - Status do banco de dados",
+            "/api/database/backup": "GET - Backup em JSON"
         }
     }
 
 @app.get("/whales")
 async def get_whales():
-    """Retorna dados de todas as whales"""
+    """Retorna dados de todas as whales COM MÉTRICAS REAIS"""
     whales = await fetch_all_whales()
     cache["whales"] = whales
     cache["last_update"] = datetime.now()
     
+    # NOVO FASE 4: Calcular métricas reais
+    metrics = await calculate_real_metrics(whales)
+    cache["metrics"] = metrics
+    
     return {
         "whales": whales,
         "count": len(whales),
+        "metrics": metrics,  # NOVO: Métricas calculadas do banco de dados
         "last_update": cache["last_update"].isoformat()
     }
 
@@ -626,6 +707,7 @@ async def health_check():
         "timestamp": datetime.now().isoformat(),
         "total_whales": len(KNOWN_WHALES),
         "telegram_enabled": TELEGRAM_ENABLED,
+        "database_connected": db.db_pool is not None,
         "scheduler_running": scheduler.running,
         "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None
     }
@@ -640,6 +722,7 @@ async def keep_alive():
         "status": "alive",
         "timestamp": datetime.now().isoformat(),
         "scheduler_running": scheduler.running,
+        "database_connected": db.db_pool is not None,
         "total_whales": len(KNOWN_WHALES),
         "message": "Serviço ativo e monitorando!"
     }
@@ -721,16 +804,39 @@ async def send_telegram_resume():
         raise HTTPException(status_code=500, detail=str(e))
 
 # ============================================
+# NOVO FASE 4: ENDPOINTS DO BANCO DE DADOS
+# ============================================
+
+@app.get("/api/database/health")
+async def database_health():
+    """Retorna estatísticas do banco de dados"""
+    health = await db.get_database_health()
+    return health
+
+@app.get("/api/database/backup")
+async def database_backup():
+    """Exporta backup completo em JSON"""
+    backup = await db.export_backup_json()
+    return backup
+
+# ============================================
 # NOVO: STARTUP E SHUTDOWN EVENTS
 # ============================================
 @app.on_event("startup")
 async def startup_event():
-    """Inicializa o scheduler ao subir a aplicação"""
+    """Inicializa o scheduler e banco de dados ao subir a aplicação"""
     print("🚀 ============================================")
-    print("🚀 INICIANDO HYPERLIQUID WHALE TRACKER API")
+    print("🚀 HYPERLIQUID WHALE TRACKER API - FASE 4")
     print("🚀 ============================================")
     print(f"📊 Total de whales carregadas: {len(KNOWN_WHALES)}")
     print(f"📱 Telegram habilitado: {TELEGRAM_ENABLED}")
+    
+    # NOVO FASE 4: Inicializar banco de dados
+    db_connected = await db.init_db()
+    if db_connected:
+        print("✅ PostgreSQL conectado e pronto!")
+    else:
+        print("⚠️ Sistema rodando sem banco de dados (métricas mockadas)")
     
     # Adicionar job de monitoramento a cada 30 segundos
     scheduler.add_job(
@@ -752,10 +858,15 @@ async def startup_event():
 
 @app.on_event("shutdown")
 async def shutdown_event():
-    """Para o scheduler ao desligar a aplicação"""
-    print("\n🛑 Desligando scheduler...")
+    """Para o scheduler e fecha banco ao desligar a aplicação"""
+    print("\n🛑 Desligando sistema...")
     scheduler.shutdown()
-    print("✅ Scheduler desligado com sucesso!")
+    print("✅ Scheduler desligado")
+    
+    # NOVO FASE 4: Fechar conexão do banco
+    await db.close_db()
+    print("✅ Banco de dados fechado")
+    print("👋 Sistema desligado com sucesso!")
 
 if __name__ == "__main__":
     import uvicorn
