@@ -89,8 +89,38 @@ KNOWN_WHALES = load_whales()
 # Cache para armazenar dados
 cache = {
     "whales": [],
-    "last_update": None
+    "last_update": None,
+    "market_prices": {}  # 🆕 BUG FIX 1: Cache de preços de mercado
 }
+
+# ============================================
+# 🆕 BUG FIX 1: BUSCAR PREÇOS REAIS DE MERCADO
+# ============================================
+async def fetch_market_prices() -> dict:
+    """
+    Busca preços atuais de mercado de TODOS os tokens via API Hyperliquid
+    Retorna: {"BTC": 43250.50, "ETH": 2280.30, ...}
+    """
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            response = await client.post(
+                "https://api.hyperliquid.xyz/info",
+                json={"type": "allMids"}
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                # data é um dict: {"BTC": "43250.5", "ETH": "2280.3", ...}
+                prices = {coin: float(price) for coin, price in data.items()}
+                cache["market_prices"] = prices
+                print(f"✅ Preços atualizados: {len(prices)} tokens")
+                return prices
+            else:
+                print(f"⚠️ Erro ao buscar preços: HTTP {response.status_code}")
+                return cache.get("market_prices", {})
+    except Exception as e:
+        print(f"❌ Erro ao buscar preços de mercado: {e}")
+        return cache.get("market_prices", {})
 
 # ============================================
 # FUNÇÕES AUXILIARES SAFE (PREVENIR ERROS DE NONE)
@@ -117,7 +147,8 @@ def safe_int(value, default=0):
 # SISTEMA DE ALERTAS TELEGRAM
 # ============================================
 
-# Tracking de estados para alertas inteligentes
+# 🆕 BUG FIX 2: Estado agora é carregado do banco de dados
+# Será inicializado em startup_event()
 alert_state = {
     "positions": {},  # {address_coin: position_data}
     "orders": {},     # {address_order: order_data}
@@ -322,6 +353,9 @@ async def check_and_alert_positions(whale_data: dict):
                 await db.close_trade(address, coin, exit_price, unrealized_pnl)
             
             await telegram_bot.send_message(message.strip())
+    
+    # 🆕 BUG FIX 2: Salvar estado após cada verificação
+    await db.save_alert_state(alert_state)
 
 async def check_and_alert_orders(whale_data: dict):
     """Verifica orders e envia alertas"""
@@ -384,6 +418,9 @@ async def check_and_alert_orders(whale_data: dict):
 ⏰ {get_brt_time()} BRT
 """
             await telegram_bot.send_message(message.strip())
+    
+    # 🆕 BUG FIX 2: Salvar estado após cada verificação
+    await db.save_alert_state(alert_state)
 
 # ============================================
 # MODELOS PYDANTIC
@@ -414,14 +451,22 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
             if response.status_code == 200:
                 data = response.json()
                 
+                # 🆕 BUG FIX 1: Buscar preços de mercado atuais
+                market_prices = cache.get("market_prices", {})
+                
                 # Processar posições
                 positions = []
                 if "assetPositions" in data:
                     for pos in data["assetPositions"]:
                         if "position" in pos:
                             p = pos["position"]
+                            coin = p.get("coin", "")
+                            
+                            # 🆕 BUG FIX 1: Adicionar markPx (preço de mercado atual)
+                            mark_px = market_prices.get(coin, 0)
+                            
                             positions.append({
-                                "coin": p.get("coin", ""),
+                                "coin": coin,
                                 "side": p.get("szi", "0")[0] if p.get("szi", "0") else "0",
                                 "size": abs(safe_float(p.get("szi", 0))),
                                 "szi": p.get("szi", "0"),
@@ -429,7 +474,8 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
                                 "positionValue": p.get("positionValue", "0"),
                                 "unrealizedPnl": p.get("unrealizedPnl", "0"),
                                 "leverage": p.get("leverage", {}),
-                                "liquidationPx": p.get("liquidationPx", "0")
+                                "liquidationPx": p.get("liquidationPx", "0"),
+                                "markPx": str(mark_px)  # 🆕 BUG FIX 1: Preço real de mercado
                             })
                 
                 # Processar orders
@@ -493,6 +539,9 @@ async def fetch_whale_data(address: str, nickname: str = None) -> dict:
 
 async def fetch_all_whales():
     """Busca dados de todas as whales em paralelo"""
+    # 🆕 BUG FIX 1: Atualizar preços de mercado ANTES de buscar whales
+    await fetch_market_prices()
+    
     tasks = [fetch_whale_data(addr, nickname) for addr, nickname in KNOWN_WHALES.items()]
     results = await asyncio.gather(*tasks)
     return results
@@ -521,7 +570,11 @@ scheduler = AsyncIOScheduler()
 async def root():
     return {
         "message": "Hyperliquid Whale Tracker API",
-        "version": "4.0 - FASE 5 (Métricas Individuais)",
+        "version": "5.1 - BUGS CRÍTICOS CORRIGIDOS ✅",
+        "fixes": [
+            "BUG 1: Preços reais via /info allMids",
+            "BUG 2: Estado persistente no PostgreSQL"
+        ],
         "telegram_enabled": TELEGRAM_ENABLED,
         "database_enabled": db.db_pool is not None,
         "total_whales": len(KNOWN_WHALES),
@@ -536,7 +589,8 @@ async def root():
             "/telegram/status": "GET - Status dos alertas Telegram",
             "/telegram/send-resume": "POST - Envia resumo via Telegram",
             "/api/database/health": "GET - Status do banco de dados",
-            "/api/database/backup": "GET - Backup em JSON"
+            "/api/database/backup": "GET - Backup em JSON",
+            "/api/database/trades": "GET - Histórico de trades"
         }
     }
 
@@ -548,7 +602,7 @@ async def get_whales():
     cache["last_update"] = datetime.now()
     
     return {
-        "whales": whales,  # ✅ FASE 5: Cada whale tem seu campo "metrics"
+        "whales": whales,  # ✅ FASE 5: Cada whale tem seu campo "metrics" + markPx nas posições
         "count": len(whales),
         "last_update": cache["last_update"].isoformat()
     }
@@ -621,6 +675,9 @@ async def delete_whale(address: str):
         for key in keys_to_remove:
             alert_state["orders"].pop(key, None)
         
+        # 🆕 BUG FIX 2: Salvar estado atualizado
+        await db.save_alert_state(alert_state)
+        
         # Atualizar cache
         cache["whales"] = [w for w in cache["whales"] if w.get("address") != address]
         cache["last_update"] = datetime.now()
@@ -648,7 +705,8 @@ async def health_check():
         "telegram_enabled": TELEGRAM_ENABLED,
         "database_connected": db.db_pool is not None,
         "scheduler_running": scheduler.running,
-        "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None
+        "cache_age": (datetime.now() - cache["last_update"]).seconds if cache["last_update"] else None,
+        "market_prices_cached": len(cache.get("market_prices", {}))
     }
 
 @app.get("/keep-alive")
@@ -745,15 +803,55 @@ async def database_backup():
     backup = await db.export_backup_json()
     return backup
 
+# 🆕 NOVO ENDPOINT: Histórico de trades
+@app.get("/api/database/trades")
+async def get_trades(limit: int = 100, wallet: str = None):
+    """
+    Retorna histórico de trades
+    - limit: número máximo de trades (padrão 100)
+    - wallet: filtrar por endereço da wallet (opcional)
+    """
+    try:
+        if not db.db_pool:
+            raise HTTPException(status_code=503, detail="Banco de dados não conectado")
+        
+        async with db.db_pool.acquire() as conn:
+            if wallet:
+                query = """
+                SELECT * FROM trades 
+                WHERE wallet = $1
+                ORDER BY open_timestamp DESC 
+                LIMIT $2
+                """
+                trades = await conn.fetch(query, wallet, limit)
+            else:
+                query = """
+                SELECT * FROM trades 
+                ORDER BY open_timestamp DESC 
+                LIMIT $1
+                """
+                trades = await conn.fetch(query, limit)
+            
+            return {
+                "trades": [dict(row) for row in trades],
+                "count": len(trades),
+                "filtered_by_wallet": wallet
+            }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 # ============================================
 # STARTUP E SHUTDOWN EVENTS
 # ============================================
 @app.on_event("startup")
 async def startup_event():
     """Inicializa o scheduler e banco de dados ao subir a aplicação"""
+    global alert_state
+    
     print("🚀 ============================================")
-    print("🚀 HYPERLIQUID WHALE TRACKER API - FASE 5")
-    print("🚀 Métricas INDIVIDUAIS por Whale")
+    print("🚀 HYPERLIQUID WHALE TRACKER API - v5.1")
+    print("🚀 ✅ BUG FIX 1: Preços Reais de Mercado")
+    print("🚀 ✅ BUG FIX 2: Estado Persistente no PostgreSQL")
     print("🚀 ============================================")
     print(f"📊 Total de whales carregadas: {len(KNOWN_WHALES)}")
     print(f"📱 Telegram habilitado: {TELEGRAM_ENABLED}")
@@ -762,8 +860,21 @@ async def startup_event():
     db_connected = await db.init_db()
     if db_connected:
         print("✅ PostgreSQL conectado e pronto!")
+        
+        # 🆕 BUG FIX 2: Carregar estado de alertas do banco
+        loaded_state = await db.load_alert_state()
+        if loaded_state:
+            alert_state.update(loaded_state)
+            print(f"✅ Estado de alertas carregado do banco: {len(alert_state['positions'])} posições, {len(alert_state['orders'])} orders")
+        else:
+            print("📝 Nenhum estado anterior encontrado, iniciando do zero")
     else:
         print("⚠️ Sistema rodando sem banco de dados (métricas não disponíveis)")
+    
+    # 🆕 BUG FIX 1: Buscar preços iniciais
+    print("🔄 Buscando preços de mercado iniciais...")
+    await fetch_market_prices()
+    print(f"✅ {len(cache.get('market_prices', {}))} preços carregados")
     
     # Adicionar job de monitoramento a cada 30 segundos
     scheduler.add_job(
@@ -787,6 +898,12 @@ async def startup_event():
 async def shutdown_event():
     """Para o scheduler e fecha banco ao desligar a aplicação"""
     print("\n🛑 Desligando sistema...")
+    
+    # 🆕 BUG FIX 2: Salvar estado antes de desligar
+    if db.db_pool:
+        await db.save_alert_state(alert_state)
+        print("✅ Estado de alertas salvo no banco")
+    
     scheduler.shutdown()
     print("✅ Scheduler desligado")
     
