@@ -2,6 +2,7 @@
 database.py - Sistema de banco de dados PostgreSQL para Whale Tracker
 Responsável por: tracking de trades, liquidações e cálculo de métricas reais
 FASE 5: Métricas INDIVIDUAIS por wallet
+🆕 BUG FIX 2: Estado de alertas persistente no PostgreSQL
 """
 
 import os
@@ -9,6 +10,7 @@ import asyncpg
 from datetime import datetime, timedelta
 from typing import List, Dict, Optional
 import asyncio
+import json
 
 # ============================================
 # CONFIGURAÇÃO DO POSTGRESQL
@@ -111,6 +113,16 @@ async def create_tables():
     );
     """
     
+    # 🆕 BUG FIX 2: Nova tabela para estado de alertas
+    create_alert_state_table = """
+    CREATE TABLE IF NOT EXISTS alert_state (
+        id SERIAL PRIMARY KEY,
+        state_key VARCHAR(50) UNIQUE NOT NULL,
+        state_data JSONB NOT NULL,
+        updated_at TIMESTAMP DEFAULT NOW()
+    );
+    """
+    
     # Criar índices para performance
     create_indexes = """
     CREATE INDEX IF NOT EXISTS idx_trades_wallet ON trades(wallet);
@@ -120,6 +132,7 @@ async def create_tables():
     CREATE INDEX IF NOT EXISTS idx_liquidations_timestamp ON liquidations(timestamp);
     CREATE INDEX IF NOT EXISTS idx_wallet_snapshots_wallet ON wallet_snapshots(wallet);
     CREATE INDEX IF NOT EXISTS idx_wallet_snapshots_timestamp ON wallet_snapshots(timestamp);
+    CREATE INDEX IF NOT EXISTS idx_alert_state_key ON alert_state(state_key);
     """
     
     try:
@@ -127,11 +140,86 @@ async def create_tables():
             await conn.execute(create_trades_table)
             await conn.execute(create_liquidations_table)
             await conn.execute(create_wallet_snapshots_table)
+            await conn.execute(create_alert_state_table)  # 🆕 BUG FIX 2
             await conn.execute(create_indexes)
             print("✅ Tabelas e índices criados/verificados")
     except Exception as e:
         print(f"❌ Erro ao criar tabelas: {e}")
         raise
+
+# ============================================
+# 🆕 BUG FIX 2: FUNÇÕES DE ESTADO PERSISTENTE
+# ============================================
+
+async def save_alert_state(alert_state: dict):
+    """
+    Salva o estado atual de alertas no PostgreSQL
+    Evita perda de estado quando Render reinicia o container
+    """
+    if not db_pool:
+        return
+    
+    try:
+        # Converter set para list para JSON
+        state_to_save = {
+            "positions": alert_state.get("positions", {}),
+            "orders": alert_state.get("orders", {}),
+            "liquidation_warnings": list(alert_state.get("liquidation_warnings", set())),
+            "last_alert_time": alert_state.get("last_alert_time", {})
+        }
+        
+        async with db_pool.acquire() as conn:
+            # Usar UPSERT (INSERT ... ON CONFLICT UPDATE)
+            query = """
+            INSERT INTO alert_state (state_key, state_data, updated_at)
+            VALUES ($1, $2, NOW())
+            ON CONFLICT (state_key) 
+            DO UPDATE SET 
+                state_data = $2,
+                updated_at = NOW()
+            """
+            
+            await conn.execute(
+                query,
+                'current_alert_state',
+                json.dumps(state_to_save)
+            )
+            
+    except Exception as e:
+        print(f"❌ Erro ao salvar estado de alertas: {e}")
+
+async def load_alert_state() -> Optional[dict]:
+    """
+    Carrega o estado de alertas do PostgreSQL ao iniciar
+    Retorna None se não houver estado salvo
+    """
+    if not db_pool:
+        return None
+    
+    try:
+        async with db_pool.acquire() as conn:
+            query = """
+            SELECT state_data FROM alert_state
+            WHERE state_key = $1
+            LIMIT 1
+            """
+            
+            result = await conn.fetchval(query, 'current_alert_state')
+            
+            if result:
+                state_data = json.loads(result) if isinstance(result, str) else result
+                
+                # Converter list de volta para set
+                state_data['liquidation_warnings'] = set(state_data.get('liquidation_warnings', []))
+                
+                print(f"✅ Estado carregado: {len(state_data.get('positions', {}))} posições, {len(state_data.get('orders', {}))} orders")
+                return state_data
+            else:
+                return None
+                
+    except Exception as e:
+        print(f"❌ Erro ao carregar estado de alertas: {e}")
+        return None
 
 # ============================================
 # FUNÇÕES DE TRACKING DE TRADES
@@ -271,7 +359,7 @@ async def save_wallet_snapshot(wallet: str, nickname: str, total_value: float, p
         print(f"❌ Erro ao salvar snapshot: {e}")
 
 # ============================================
-# ✅ NOVO FASE 5: MÉTRICAS INDIVIDUAIS POR WALLET
+# ✅ FASE 5: MÉTRICAS INDIVIDUAIS POR WALLET
 # ============================================
 
 async def calculate_wallet_metrics(wallet: str, current_positions: list) -> dict:
@@ -371,19 +459,19 @@ async def calculate_wallet_metrics(wallet: str, current_positions: list) -> dict
                 portfolio_heat = (total_margin_used / total_position_value * 100) if total_position_value > 0 else 0.0
             
             # ===== LIQUIDAÇÕES 1D/1W/1M =====
-            liq_1d_query = f"""
+            liq_1d_query = """
             SELECT COUNT(*) FROM liquidations
             WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '1 day'
             """
             liquidations_1d = await conn.fetchval(liq_1d_query, wallet) or 0
             
-            liq_1w_query = f"""
+            liq_1w_query = """
             SELECT COUNT(*) FROM liquidations
             WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '7 days'
             """
             liquidations_1w = await conn.fetchval(liq_1w_query, wallet) or 0
             
-            liq_1m_query = f"""
+            liq_1m_query = """
             SELECT COUNT(*) FROM liquidations
             WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '30 days'
             """
@@ -554,6 +642,11 @@ async def get_database_health() -> dict:
             """)
             db_size = await conn.fetchval("SELECT pg_size_pretty(pg_database_size(current_database()))")
             
+            # 🆕 BUG FIX 2: Incluir info de estado de alertas
+            alert_state_exists = await conn.fetchval("""
+                SELECT COUNT(*) FROM alert_state WHERE state_key = 'current_alert_state'
+            """)
+            
             return {
                 "status": "connected",
                 "total_trades": total_trades,
@@ -563,7 +656,8 @@ async def get_database_health() -> dict:
                 "liquidations_24h": liquidations_24h,
                 "database_size": db_size,
                 "pool_size": db_pool.get_size(),
-                "pool_free": db_pool.get_idle_size()
+                "pool_free": db_pool.get_idle_size(),
+                "alert_state_saved": alert_state_exists > 0  # 🆕 BUG FIX 2
             }
     except Exception as e:
         return {"status": "error", "error": str(e)}
@@ -578,10 +672,17 @@ async def export_backup_json() -> dict:
             trades = await conn.fetch("SELECT * FROM trades ORDER BY open_timestamp DESC")
             liquidations = await conn.fetch("SELECT * FROM liquidations ORDER BY timestamp DESC")
             
+            # 🆕 BUG FIX 2: Incluir estado de alertas no backup
+            alert_state_data = await conn.fetchval("""
+                SELECT state_data FROM alert_state 
+                WHERE state_key = 'current_alert_state'
+            """)
+            
             return {
                 "timestamp": datetime.now().isoformat(),
                 "trades": [dict(row) for row in trades],
                 "liquidations": [dict(row) for row in liquidations],
+                "alert_state": json.loads(alert_state_data) if alert_state_data else None,  # 🆕 BUG FIX 2
                 "total_trades": len(trades),
                 "total_liquidations": len(liquidations)
             }
