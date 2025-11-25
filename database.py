@@ -1,6 +1,7 @@
 """
 database.py - Sistema de banco de dados PostgreSQL para Whale Tracker
 Responsável por: tracking de trades, liquidações e cálculo de métricas reais
+FASE 5: Métricas INDIVIDUAIS por wallet
 """
 
 import os
@@ -270,23 +271,163 @@ async def save_wallet_snapshot(wallet: str, nickname: str, total_value: float, p
         print(f"❌ Erro ao salvar snapshot: {e}")
 
 # ============================================
-# FUNÇÕES DE CÁLCULO DE MÉTRICAS
+# ✅ NOVO FASE 5: MÉTRICAS INDIVIDUAIS POR WALLET
 # ============================================
 
-async def calculate_win_rate() -> dict:
-    """Calcula Win Rate global, LONG e SHORT"""
+async def calculate_wallet_metrics(wallet: str, current_positions: list) -> dict:
+    """
+    Calcula TODAS as métricas para UMA wallet específica
+    Retorna dict pronto para ser inserido no campo 'metrics' da whale
+    """
     if not db_pool:
         return {
-            "global": 0.0,
-            "long": 0.0,
-            "short": 0.0,
-            "total_trades": 0,
-            "warning": "Database not connected"
+            "win_rate_global": None,
+            "win_rate_long": None,
+            "win_rate_short": None,
+            "sharpe_ratio": None,
+            "portfolio_heat": None,
+            "liquidations_1d": None,
+            "liquidations_1w": None,
+            "liquidations_1m": None,
+            "total_trades": 0
         }
     
     try:
         async with db_pool.acquire() as conn:
-            # Win Rate Global
+            # ===== WIN RATE GLOBAL =====
+            win_rate_query = """
+            SELECT 
+                COUNT(*) FILTER (WHERE pnl > 0) as wins,
+                COUNT(*) as total
+            FROM trades
+            WHERE wallet = $1 AND status = 'closed' AND pnl IS NOT NULL
+            """
+            win_rate_result = await conn.fetchrow(win_rate_query, wallet)
+            total_trades = win_rate_result['total'] or 0
+            wins = win_rate_result['wins'] or 0
+            win_rate_global = (wins / total_trades * 100) if total_trades > 0 else None
+            
+            # ===== WIN RATE LONG =====
+            long_query = """
+            SELECT 
+                COUNT(*) FILTER (WHERE pnl > 0) as wins,
+                COUNT(*) as total
+            FROM trades
+            WHERE wallet = $1 AND status = 'closed' AND side = 'LONG' AND pnl IS NOT NULL
+            """
+            long_result = await conn.fetchrow(long_query, wallet)
+            total_long = long_result['total'] or 0
+            wins_long = long_result['wins'] or 0
+            win_rate_long = (wins_long / total_long * 100) if total_long > 0 else None
+            
+            # ===== WIN RATE SHORT =====
+            short_query = """
+            SELECT 
+                COUNT(*) FILTER (WHERE pnl > 0) as wins,
+                COUNT(*) as total
+            FROM trades
+            WHERE wallet = $1 AND status = 'closed' AND side = 'SHORT' AND pnl IS NOT NULL
+            """
+            short_result = await conn.fetchrow(short_query, wallet)
+            total_short = short_result['total'] or 0
+            wins_short = short_result['wins'] or 0
+            win_rate_short = (wins_short / total_short * 100) if total_short > 0 else None
+            
+            # ===== SHARPE RATIO (últimos 30 dias) =====
+            sharpe_query = """
+            SELECT pnl
+            FROM trades
+            WHERE wallet = $1 
+              AND status = 'closed' 
+              AND pnl IS NOT NULL
+              AND close_timestamp >= NOW() - INTERVAL '30 days'
+            ORDER BY close_timestamp
+            """
+            sharpe_results = await conn.fetch(sharpe_query, wallet)
+            
+            sharpe_ratio = None
+            if len(sharpe_results) >= 30:
+                pnls = [float(row['pnl']) for row in sharpe_results]
+                avg_return = sum(pnls) / len(pnls)
+                variance = sum((x - avg_return) ** 2 for x in pnls) / len(pnls)
+                std_dev = variance ** 0.5
+                sharpe_ratio = (avg_return / std_dev) if std_dev > 0 else 0.0
+            
+            # ===== PORTFOLIO HEAT (posições atuais) =====
+            portfolio_heat = None
+            if current_positions:
+                total_margin_used = 0.0
+                total_position_value = 0.0
+                
+                for pos in current_positions:
+                    position_value = abs(float(pos.get("positionValue", 0)))
+                    leverage_data = pos.get("leverage", {})
+                    leverage = float(leverage_data.get("value", 1)) if isinstance(leverage_data, dict) else 1.0
+                    
+                    margin = position_value / leverage if leverage > 0 else position_value
+                    total_margin_used += margin
+                    total_position_value += position_value
+                
+                portfolio_heat = (total_margin_used / total_position_value * 100) if total_position_value > 0 else 0.0
+            
+            # ===== LIQUIDAÇÕES 1D/1W/1M =====
+            liq_1d_query = f"""
+            SELECT COUNT(*) FROM liquidations
+            WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '1 day'
+            """
+            liquidations_1d = await conn.fetchval(liq_1d_query, wallet) or 0
+            
+            liq_1w_query = f"""
+            SELECT COUNT(*) FROM liquidations
+            WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '7 days'
+            """
+            liquidations_1w = await conn.fetchval(liq_1w_query, wallet) or 0
+            
+            liq_1m_query = f"""
+            SELECT COUNT(*) FROM liquidations
+            WHERE wallet = $1 AND timestamp >= NOW() - INTERVAL '30 days'
+            """
+            liquidations_1m = await conn.fetchval(liq_1m_query, wallet) or 0
+            
+            # ===== RETORNAR MÉTRICAS =====
+            return {
+                "win_rate_global": round(win_rate_global, 2) if win_rate_global is not None else None,
+                "win_rate_long": round(win_rate_long, 2) if win_rate_long is not None else None,
+                "win_rate_short": round(win_rate_short, 2) if win_rate_short is not None else None,
+                "sharpe_ratio": round(sharpe_ratio, 2) if sharpe_ratio is not None else None,
+                "portfolio_heat": round(portfolio_heat, 2) if portfolio_heat is not None else None,
+                "liquidations_1d": liquidations_1d,
+                "liquidations_1w": liquidations_1w,
+                "liquidations_1m": liquidations_1m,
+                "total_trades": total_trades
+            }
+            
+    except Exception as e:
+        print(f"❌ Erro ao calcular métricas da wallet {wallet[:8]}: {e}")
+        return {
+            "win_rate_global": None,
+            "win_rate_long": None,
+            "win_rate_short": None,
+            "sharpe_ratio": None,
+            "portfolio_heat": None,
+            "liquidations_1d": None,
+            "liquidations_1w": None,
+            "liquidations_1m": None,
+            "total_trades": 0,
+            "error": str(e)
+        }
+
+# ============================================
+# FUNÇÕES LEGADAS (COMPATIBILIDADE)
+# ============================================
+
+async def calculate_win_rate() -> dict:
+    """Calcula Win Rate global (TODAS as whales) - LEGADO"""
+    if not db_pool:
+        return {"global": 0.0, "long": 0.0, "short": 0.0, "total_trades": 0}
+    
+    try:
+        async with db_pool.acquire() as conn:
             global_query = """
             SELECT 
                 COUNT(*) FILTER (WHERE pnl > 0) as wins,
@@ -295,12 +436,10 @@ async def calculate_win_rate() -> dict:
             WHERE status = 'closed' AND pnl IS NOT NULL
             """
             global_result = await conn.fetchrow(global_query)
-            
             total_trades = global_result['total'] or 0
             wins = global_result['wins'] or 0
             win_rate_global = (wins / total_trades * 100) if total_trades > 0 else 0.0
             
-            # Win Rate LONG
             long_query = """
             SELECT 
                 COUNT(*) FILTER (WHERE pnl > 0) as wins,
@@ -313,7 +452,6 @@ async def calculate_win_rate() -> dict:
             wins_long = long_result['wins'] or 0
             win_rate_long = (wins_long / total_long * 100) if total_long > 0 else 0.0
             
-            # Win Rate SHORT
             short_query = """
             SELECT 
                 COUNT(*) FILTER (WHERE pnl > 0) as wins,
@@ -330,95 +468,55 @@ async def calculate_win_rate() -> dict:
                 "global": round(win_rate_global, 2),
                 "long": round(win_rate_long, 2),
                 "short": round(win_rate_short, 2),
-                "total_trades": total_trades,
-                "total_long": total_long,
-                "total_short": total_short
+                "total_trades": total_trades
             }
-            
     except Exception as e:
-        print(f"❌ Erro ao calcular Win Rate: {e}")
-        return {
-            "global": 0.0,
-            "long": 0.0,
-            "short": 0.0,
-            "total_trades": 0,
-            "error": str(e)
-        }
+        return {"global": 0.0, "long": 0.0, "short": 0.0, "total_trades": 0, "error": str(e)}
 
 async def calculate_sharpe_ratio() -> dict:
-    """Calcula Sharpe Ratio dos últimos 30 dias"""
+    """Calcula Sharpe Ratio global - LEGADO"""
     if not db_pool:
-        return {"sharpe_ratio": 0.0, "warning": "Database not connected"}
+        return {"sharpe_ratio": 0.0}
     
     try:
         async with db_pool.acquire() as conn:
             query = """
-            SELECT pnl
-            FROM trades
-            WHERE status = 'closed' 
-              AND pnl IS NOT NULL
+            SELECT pnl FROM trades
+            WHERE status = 'closed' AND pnl IS NOT NULL
               AND close_timestamp >= NOW() - INTERVAL '30 days'
-            ORDER BY close_timestamp
             """
-            
             results = await conn.fetch(query)
-            
             if len(results) < 30:
-                return {
-                    "sharpe_ratio": 0.0,
-                    "message": f"Precisa de 30+ trades (atual: {len(results)})"
-                }
+                return {"sharpe_ratio": 0.0, "message": f"Precisa 30+ trades ({len(results)})"}
             
-            # Calcular retornos
             pnls = [float(row['pnl']) for row in results]
             avg_return = sum(pnls) / len(pnls)
-            
-            # Calcular desvio padrão
             variance = sum((x - avg_return) ** 2 for x in pnls) / len(pnls)
             std_dev = variance ** 0.5
-            
-            # Sharpe Ratio (assumindo risk-free rate = 0)
             sharpe = (avg_return / std_dev) if std_dev > 0 else 0.0
             
-            return {
-                "sharpe_ratio": round(sharpe, 2),
-                "trades_analyzed": len(results),
-                "avg_return": round(avg_return, 2),
-                "std_dev": round(std_dev, 2)
-            }
-            
+            return {"sharpe_ratio": round(sharpe, 2), "trades_analyzed": len(results)}
     except Exception as e:
-        print(f"❌ Erro ao calcular Sharpe Ratio: {e}")
         return {"sharpe_ratio": 0.0, "error": str(e)}
 
 async def get_liquidations_count(period_days: int) -> int:
-    """Retorna número de liquidações em um período"""
+    """Retorna liquidações globais - LEGADO"""
     if not db_pool:
         return 0
     
     try:
         async with db_pool.acquire() as conn:
-            query = """
-            SELECT COUNT(*) 
-            FROM liquidations
-            WHERE timestamp >= NOW() - INTERVAL '$1 days'
-            """
-            # Note: asyncpg doesn't support interval interpolation, so we use a workaround
             query = f"""
-            SELECT COUNT(*) 
-            FROM liquidations
+            SELECT COUNT(*) FROM liquidations
             WHERE timestamp >= NOW() - INTERVAL '{period_days} days'
             """
-            
             count = await conn.fetchval(query)
             return count or 0
-            
     except Exception as e:
-        print(f"❌ Erro ao contar liquidações: {e}")
         return 0
 
 async def calculate_portfolio_heat(current_whales_data: list) -> float:
-    """Calcula Portfolio Heat atual (Margin usado / Capital total)"""
+    """Calcula Portfolio Heat global - LEGADO"""
     try:
         total_margin_used = 0.0
         total_account_value = 0.0
@@ -427,58 +525,34 @@ async def calculate_portfolio_heat(current_whales_data: list) -> float:
             if "error" not in whale:
                 positions = whale.get("positions", [])
                 for pos in positions:
-                    # Margin usado = valor da posição / leverage
                     position_value = abs(float(pos.get("positionValue", 0)))
                     leverage_data = pos.get("leverage", {})
                     leverage = float(leverage_data.get("value", 1)) if isinstance(leverage_data, dict) else 1.0
-                    
                     margin = position_value / leverage if leverage > 0 else position_value
                     total_margin_used += margin
-                
-                # Somar valor total da conta
                 total_account_value += whale.get("total_position_value", 0)
         
-        # Heat = (Margin / Total) * 100
         heat = (total_margin_used / total_account_value * 100) if total_account_value > 0 else 0.0
-        
         return round(heat, 2)
-        
     except Exception as e:
-        print(f"❌ Erro ao calcular Portfolio Heat: {e}")
         return 0.0
 
 async def get_database_health() -> dict:
     """Retorna estatísticas de saúde do banco de dados"""
     if not db_pool:
-        return {
-            "status": "disconnected",
-            "message": "Database not configured"
-        }
+        return {"status": "disconnected"}
     
     try:
         async with db_pool.acquire() as conn:
-            # Total de trades
             total_trades = await conn.fetchval("SELECT COUNT(*) FROM trades")
-            
-            # Trades abertos
             open_trades = await conn.fetchval("SELECT COUNT(*) FROM trades WHERE status = 'open'")
-            
-            # Trades fechados
             closed_trades = await conn.fetchval("SELECT COUNT(*) FROM trades WHERE status = 'closed'")
-            
-            # Total de liquidações
             total_liquidations = await conn.fetchval("SELECT COUNT(*) FROM liquidations")
-            
-            # Liquidações últimas 24h
             liquidations_24h = await conn.fetchval("""
                 SELECT COUNT(*) FROM liquidations 
                 WHERE timestamp >= NOW() - INTERVAL '1 day'
             """)
-            
-            # Tamanho do banco (MB)
-            db_size = await conn.fetchval("""
-                SELECT pg_size_pretty(pg_database_size(current_database()))
-            """)
+            db_size = await conn.fetchval("SELECT pg_size_pretty(pg_database_size(current_database()))")
             
             return {
                 "status": "connected",
@@ -491,45 +565,25 @@ async def get_database_health() -> dict:
                 "pool_size": db_pool.get_size(),
                 "pool_free": db_pool.get_idle_size()
             }
-            
     except Exception as e:
-        print(f"❌ Erro ao verificar saúde do DB: {e}")
-        return {
-            "status": "error",
-            "error": str(e)
-        }
-
-# ============================================
-# FUNÇÃO DE BACKUP (JSON EXPORT)
-# ============================================
+        return {"status": "error", "error": str(e)}
 
 async def export_backup_json() -> dict:
-    """Exporta backup de todos os trades em JSON"""
+    """Exporta backup completo em JSON"""
     if not db_pool:
         return {"error": "Database not connected"}
     
     try:
         async with db_pool.acquire() as conn:
-            trades = await conn.fetch("""
-                SELECT * FROM trades 
-                ORDER BY open_timestamp DESC
-            """)
+            trades = await conn.fetch("SELECT * FROM trades ORDER BY open_timestamp DESC")
+            liquidations = await conn.fetch("SELECT * FROM liquidations ORDER BY timestamp DESC")
             
-            liquidations = await conn.fetch("""
-                SELECT * FROM liquidations 
-                ORDER BY timestamp DESC
-            """)
-            
-            backup_data = {
+            return {
                 "timestamp": datetime.now().isoformat(),
                 "trades": [dict(row) for row in trades],
                 "liquidations": [dict(row) for row in liquidations],
                 "total_trades": len(trades),
                 "total_liquidations": len(liquidations)
             }
-            
-            return backup_data
-            
     except Exception as e:
-        print(f"❌ Erro ao exportar backup: {e}")
         return {"error": str(e)}
